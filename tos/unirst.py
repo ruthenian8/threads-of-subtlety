@@ -1,9 +1,10 @@
 """UniRST integration for the Threads of Subtlety preprocessing pipeline.
 
-The public :mod:`isanlp_rst` API exposes two operations that are important for
-this project: parsing raw text and parsing a supplied sequence of EDUs.  This
-module uses the former exactly once for segmentation and the latter for every
-relation inventory, so all inventory-specific predictions share boundaries.
+The public :mod:`isanlp_rst` API parses either raw text or a supplied sequence
+of EDUs.  Raw-text parsing also performs expensive discourse-tree decoding,
+so segmentation calls the universal parser's learned segmenter directly.  The
+public EDU-based parser is then used for every relation inventory, ensuring
+that all inventory-specific predictions share the cached boundaries.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ SEGMENTATION_CHECKPOINT_INTERVAL = 100
 
 
 class UniRSTAdapter:
-    """Adapter around the public ``isanlp_rst.parser.Parser`` API."""
+    """Adapter around UniRST segmentation and EDU-based parsing."""
 
     cache_schema_version = 1
 
@@ -81,6 +82,147 @@ class UniRSTAdapter:
         gc.collect()
 
     @staticmethod
+    def _normalise_edus(edus: Iterable[str]) -> List[str]:
+        if isinstance(edus, (str, bytes)):
+            raise TypeError("UniRST EDUs must be an iterable of strings, not text")
+        normalised: List[str] = []
+        for edu in edus:
+            if not isinstance(edu, str) or not edu.strip():
+                raise ValueError("UniRST returned an empty EDU")
+            normalised.append(" ".join(edu.split()))
+        if not normalised:
+            raise ValueError("UniRST returned no EDUs")
+        return normalised
+
+    @staticmethod
+    def _segment_with_unirst_predictor(predictor: Any, text: str) -> List[str]:
+        """Run UniRST's learned EDU segmenter without decoding an RST tree.
+
+        ``isanlp_rst.parser.Parser`` currently has no public segmentation-only
+        method: ``Parser.__call__`` always runs ``parse_rst``.  This method
+        mirrors the tokenization and EDU alignment portions of ``parse_rst``,
+        but calls the model encoder directly and never invokes tree or relation
+        decoding.  Attribute checks make upstream API incompatibilities fail
+        explicitly instead of silently falling back to the expensive path.
+        """
+        try:
+            import razdel
+            import torch
+            from isanlp_rst.universal_parser.src.parser.data import Data
+            from isanlp_rst.utils.du_converter import DUConverter
+        except ImportError as exc:  # pragma: no cover - installation failure
+            raise RuntimeError(
+                "UniRST segmentation requires razdel, torch, and isanlp_rst"
+            ) from exc
+
+        model = getattr(predictor, "model", None)
+        encoder = getattr(model, "encoder", None)
+        tokenizer = getattr(predictor, "tokenizer", None)
+        tokenize = getattr(predictor, "tokenize", None)
+        remap_offsets = getattr(predictor, "remap_tree_offsets", None)
+        build_offsets = getattr(predictor, "build_offset_converter_from_words", None)
+        if not callable(encoder) or tokenizer is None or not callable(tokenize):
+            raise RuntimeError(
+                "The installed isanlp_rst version does not expose the "
+                "universal parser segmentation components expected by this adapter"
+            )
+        if not callable(remap_offsets) or not callable(build_offsets):
+            raise RuntimeError(
+                "The installed isanlp_rst version cannot align segmented EDUs "
+                "back to the original text"
+            )
+
+        razdel_tokens = list(razdel.tokenize(text))
+        word_tokens = [token.text for token in razdel_tokens]
+        word_offsets = [(token.start, token.stop) for token in razdel_tokens]
+        if not word_tokens:
+            raise ValueError("UniRST could not tokenize the scene")
+
+        # parse_rst() returns a single dummy EDU for fewer than three tokens
+        # without running the model.  Preserve that behavior here.
+        if len(word_tokens) < 3:
+            start, end = word_offsets[0][0], word_offsets[-1][1]
+            return [text[start:end]]
+
+        input_data = Data(
+            input_sentences=[word_tokens],
+            edu_breaks=[[]],
+            decoder_input=[[]],
+            relation_label=[[]],
+            parsing_breaks=[[]],
+            golden_metric=[[]],
+        )
+        batch = tokenize(input_data)
+
+        with torch.inference_mode():
+            encoder_output = encoder(
+                batch.input_sentences,
+                batch.entity_ids,
+                batch.entity_position_ids,
+                batch.edu_breaks,
+                sent_breaks=batch.sent_breaks,
+                is_test=True,
+                dataset_index=batch.dataset_index,
+            )
+
+        if not isinstance(encoder_output, (tuple, list)) or len(encoder_output) < 4:
+            raise RuntimeError("UniRST encoder did not return predicted EDU boundaries")
+        predicted_batches = encoder_output[3]
+        if not predicted_batches or len(predicted_batches) != 1:
+            raise RuntimeError("UniRST returned an invalid segmentation batch")
+
+        input_ids = batch.input_sentences[0]
+        predicted_breaks = [int(index) for index in predicted_batches[0]]
+        if (
+            not predicted_breaks
+            or predicted_breaks[-1] != len(input_ids) - 1
+            or any(
+                current <= previous
+                for previous, current in zip(predicted_breaks, predicted_breaks[1:])
+            )
+            or predicted_breaks[0] < 0
+        ):
+            raise ValueError(
+                "UniRST returned invalid or incomplete predicted EDU boundaries"
+            )
+
+        # This is the same subword-to-word alignment used by parse_rst(), but
+        # applied only to EDU leaves; no discourse tree is constructed.
+        subword_tokens = tokenizer.convert_ids_to_tokens(input_ids)
+        converter = DUConverter({}, tokenization_type="default")
+        units = converter._lists_to_isanlp_format(  # noqa: SLF001
+            subword_tokens,
+            predicted_breaks,
+            gold_tokens=word_tokens,
+        )
+        offset_positions, original_offsets = build_offsets(
+            text,
+            word_tokens,
+            word_offsets,
+        )
+        for unit in units:
+            remap_offsets(unit, offset_positions, original_offsets, text)
+        return [unit.text for unit in units]
+
+    def _segment_edus(self, text: str) -> List[str]:
+        parser = self.segmenter()
+
+        # Prefer a future/public segmentation-only API when available.  The
+        # currently pinned UniRST implementation uses the predictor path below.
+        segment_edus = getattr(parser, "segment_edus", None)
+        if callable(segment_edus):
+            return self._normalise_edus(segment_edus(text))
+
+        predictor = getattr(parser, "predictor", None)
+        if predictor is None:
+            raise RuntimeError(
+                "The UniRST parser exposes neither segment_edus() nor predictor internals"
+            )
+        return self._normalise_edus(
+            self._segment_with_unirst_predictor(predictor, text)
+        )
+
+    @staticmethod
     def _tree_root(result: Mapping[str, Any]) -> Any:
         roots = result.get("rst")
         if not roots:
@@ -125,8 +267,7 @@ class UniRSTAdapter:
         return {"tokenized": tokenized, "segments": segments}
 
     def segment_scene(self, text: str) -> Dict[str, Any]:
-        result = self.segmenter()(text)
-        edus = self.extract_edus(result)
+        edus = self._segment_edus(text)
         metadata = self._scene_token_metadata(edus)
         return {
             "text": text,

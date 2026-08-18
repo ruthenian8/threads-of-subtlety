@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from tos.unirst import (
     UniRSTAdapter,
@@ -20,6 +21,7 @@ class Unit:
 
 class FakeParser:
     calls = 0
+    segmentation_calls = 0
 
     def __init__(self, **kwargs):
         self.relinventory = kwargs["relinventory"]
@@ -37,6 +39,10 @@ class FakeParser:
             ]
         }
 
+    def segment_edus(self, text):
+        FakeParser.segmentation_calls += 1
+        return ["First EDU.", "Second EDU."]
+
     def from_edus(self, edus):
         return {
             "rst": [
@@ -50,7 +56,71 @@ class FakeParser:
         }
 
 
+class FakeEncoder:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(
+        self,
+        input_sentences,
+        entity_ids,
+        entity_position_ids,
+        edu_breaks,
+        sent_breaks,
+        is_test,
+        dataset_index,
+    ):
+        self.calls += 1
+        if not is_test:
+            raise AssertionError("The segmenter must run in inference mode")
+        return None, None, None, [[2, 5]]
+
+
+class FakeTokenizer:
+    def convert_ids_to_tokens(self, input_ids):
+        return ["▁First", "▁EDU", ".", "▁Second", "▁EDU", "."]
+
+
+class FakePredictor:
+    def __init__(self):
+        self.model = SimpleNamespace(encoder=FakeEncoder())
+        self.tokenizer = FakeTokenizer()
+
+    def tokenize(self, data):
+        return SimpleNamespace(
+            input_sentences=[list(range(6))],
+            entity_ids=None,
+            entity_position_ids=None,
+            edu_breaks=data.edu_breaks,
+            sent_breaks=None,
+            dataset_index=[0],
+        )
+
+    def build_offset_converter_from_words(self, text, tokens, offsets):
+        positions = list(range(len(text) + 1))
+        return positions, positions
+
+    def remap_tree_offsets(self, unit, positions, originals, text):
+        unit.text = text[unit.start : unit.end]
+
+
+class FakeInternalParser:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.predictor = FakePredictor()
+
+    def __call__(self, text):
+        FakeInternalParser.calls += 1
+        raise AssertionError("Full RST parsing must not run during segmentation")
+
+
 class UniRSTAdapterTest(unittest.TestCase):
+    def setUp(self):
+        FakeParser.calls = 0
+        FakeParser.segmentation_calls = 0
+        FakeInternalParser.calls = 0
+
     def make_adapter(self):
         return UniRSTAdapter(
             relation_inventories=("deu.rst.pcc",),
@@ -79,6 +149,26 @@ class UniRSTAdapterTest(unittest.TestCase):
         self.assertEqual(first[0]["edus"], ["First EDU.", "Second EDU."])
         self.assertEqual(first, second)
         self.assertEqual(FakeParser.calls, calls_after_first)
+        self.assertEqual(FakeParser.calls, 0)
+        self.assertEqual(FakeParser.segmentation_calls, 1)
+
+    def test_segmentation_does_not_invoke_full_parser(self):
+        adapter = self.make_adapter()
+
+        segmented = adapter.segment_scene("First EDU. Second EDU.")
+
+        self.assertEqual(segmented["edus"], ["First EDU.", "Second EDU."])
+        self.assertEqual(FakeParser.segmentation_calls, 1)
+        self.assertEqual(FakeParser.calls, 0)
+
+    def test_installed_api_path_stops_after_encoder_segmentation(self):
+        adapter = UniRSTAdapter(parser_factory=FakeInternalParser)
+
+        segmented = adapter.segment_scene("First EDU. Second EDU.")
+
+        self.assertEqual(segmented["edus"], ["First EDU.", "Second EDU."])
+        self.assertEqual(adapter.segmenter().predictor.model.encoder.calls, 1)
+        self.assertEqual(FakeInternalParser.calls, 0)
 
     def test_single_edu_is_marked_none(self):
         result = {"rst": [Unit(text="Only EDU.")]}
@@ -87,4 +177,3 @@ class UniRSTAdapterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
