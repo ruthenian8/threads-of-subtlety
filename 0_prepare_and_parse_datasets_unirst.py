@@ -15,12 +15,12 @@ import gc
 import os
 import re
 from collections import defaultdict
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from datasets import load_dataset
-from rich.progress import track
 from sentsplit.segment import SentSplit
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from tos.tos_dataset import Document, SceneDiscourseTree
@@ -90,7 +90,7 @@ def hc3_groups(dataset_name: str, splitter: SceneSplitter, min_char_len: int) ->
     raw_dataset = load_dataset(dataset_name, name="all")["train"]
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     document_index = 0
-    for sample in raw_dataset:
+    for sample in tqdm(raw_dataset, desc="preparing HC3", unit="document"):
         try:
             human_answer = sample["human_answers"][0].strip()
             llm_answer = sample["chatgpt_answers"][0].strip()
@@ -137,7 +137,11 @@ def mage_group(
             label=raw_dataset[split][doc_idx]["label"],
             scenes=splitter.split(raw_dataset[split][doc_idx]["text"]),
         )
-        for doc_idx in target_indices
+        for doc_idx in tqdm(
+            target_indices,
+            desc=f"preparing MAGE {split} (GPU {gpu_id})",
+            unit="document",
+        )
     ]
 
 
@@ -266,6 +270,9 @@ def paired_output(
 def parse_predictions(
     adapter: UniRSTAdapter,
     scenes: Sequence[Mapping[str, Any]],
+    on_inventory_complete: Optional[
+        Callable[[str, Mapping[str, Mapping[str, Any]]], None]
+    ] = None,
 ) -> Dict[str, Dict[str, Any]]:
     predictions: Dict[str, Dict[str, Any]] = {
         scene["scene_key"]: {} for scene in scenes
@@ -273,10 +280,12 @@ def parse_predictions(
     for relinventory in adapter.relation_inventories:
         parser = adapter.make_parser(relinventory)
         try:
-            for scene in track(
+            for scene in tqdm(
                 scenes,
-                description=f"parsing with {relinventory}",
-                transient=True,
+                desc=f"parsing {relinventory}",
+                unit="scene",
+                leave=False,
+                total=len(scenes),
             ):
                 if scene["status"] != "ok":
                     predictions[scene["scene_key"]][relinventory] = {
@@ -309,6 +318,8 @@ def parse_predictions(
                     torch.cuda.empty_cache()
             except ImportError:
                 pass
+        if on_inventory_complete is not None:
+            on_inventory_complete(relinventory, predictions)
     return predictions
 
 
@@ -373,19 +384,47 @@ def run_group(
     scene_specs = make_scene_specs(documents)
     cache_path = os.path.join(segments_dir, f"{cache_name}.pkl")
     scenes = load_or_create_segmentation_cache(
-        adapter, scene_specs, cache_path, force=force_segmentation
+        adapter,
+        scene_specs,
+        cache_path,
+        force=force_segmentation,
+        progress_desc=f"segmenting {prefix}",
     )
     adapter.release_segmenter()
-    predictions = parse_predictions(adapter, scenes)
-    write_group_outputs(
-        documents,
+
+    def save_intermediate_outputs(
+        relinventory: str, current_predictions: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        if output_mode in {"separate", "both"}:
+            # Persist only this inventory; earlier inventories are already
+            # complete and should not be serialized again.
+            write_group_outputs(
+                documents,
+                scenes,
+                current_predictions,
+                output_dir,
+                prefix,
+                (relinventory,),
+                "separate",
+            )
+
+    predictions = parse_predictions(
+        adapter,
         scenes,
-        predictions,
-        output_dir,
-        prefix,
-        adapter.relation_inventories,
-        output_mode,
+        on_inventory_complete=save_intermediate_outputs,
     )
+    if output_mode in {"paired", "both"}:
+        # Paired artifacts are the final complete product and must not expose
+        # a prefix of the relation-inventory predictions after interruption.
+        write_group_outputs(
+            documents,
+            scenes,
+            predictions,
+            output_dir,
+            prefix,
+            (),
+            "paired",
+        )
 
 
 def parse_args() -> argparse.Namespace:

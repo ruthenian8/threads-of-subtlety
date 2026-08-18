@@ -16,6 +16,8 @@ import re
 import tempfile
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
+from tqdm.auto import tqdm
+
 if TYPE_CHECKING:
     from .tos_dataset import Document, SceneDiscourseTree
 
@@ -26,6 +28,8 @@ DEFAULT_REL_INVENTORIES = (
     "deu.rst.pcc",
     "nld.rst.nldt",
 )
+
+SEGMENTATION_CHECKPOINT_INTERVAL = 100
 
 
 class UniRSTAdapter:
@@ -254,11 +258,28 @@ def _cache_metadata(
 def _valid_cache(
     cached: Any, adapter: UniRSTAdapter, scene_specs: Sequence[Mapping[str, Any]]
 ) -> bool:
+    if not _valid_cache_prefix(cached, adapter, scene_specs):
+        return False
+    return len(cached["scenes"]) == len(scene_specs)
+
+
+def _valid_cache_prefix(
+    cached: Any, adapter: UniRSTAdapter, scene_specs: Sequence[Mapping[str, Any]]
+) -> bool:
+    """Return whether a cache contains a valid completed prefix."""
     if not isinstance(cached, dict) or "metadata" not in cached or "scenes" not in cached:
         return False
-    return cached["metadata"] == _cache_metadata(adapter, scene_specs) and len(
-        cached["scenes"]
-    ) == len(scene_specs)
+    if cached["metadata"] != _cache_metadata(adapter, scene_specs):
+        return False
+    cached_scenes = cached["scenes"]
+    if not isinstance(cached_scenes, list) or len(cached_scenes) > len(scene_specs):
+        return False
+    return all(
+        isinstance(cached_scene, dict)
+        and cached_scene.get("scene_key") == scene_spec["scene_key"]
+        and cached_scene.get("text") == scene_spec["text"]
+        for cached_scene, scene_spec in zip(cached_scenes, scene_specs)
+    )
 
 
 def load_or_create_segmentation_cache(
@@ -266,16 +287,40 @@ def load_or_create_segmentation_cache(
     scene_specs: Sequence[Mapping[str, Any]],
     path: str,
     force: bool = False,
+    progress_desc: Optional[str] = None,
+    checkpoint_interval: int = SEGMENTATION_CHECKPOINT_INTERVAL,
 ) -> List[Dict[str, Any]]:
-    """Load a validated segmentation pickle or create it once."""
+    """Load a validated segmentation pickle or create it incrementally.
+
+    Checkpoints are atomically written in bounded batches, allowing an
+    interrupted run to resume without repeatedly serializing the full scene
+    list for every scene.
+    """
+    if checkpoint_interval < 1:
+        raise ValueError("checkpoint_interval must be positive")
+    metadata = _cache_metadata(adapter, scene_specs)
+    scenes: List[Dict[str, Any]] = []
     if not force and os.path.exists(path):
         with open(path, "rb") as handle:
             cached = pickle.load(handle)
         if _valid_cache(cached, adapter, scene_specs):
             return cached["scenes"]
+        if _valid_cache_prefix(cached, adapter, scene_specs):
+            scenes = list(cached["scenes"])
 
-    scenes: List[Dict[str, Any]] = []
-    for spec in scene_specs:
+    remaining_specs = scene_specs[len(scenes) :]
+    specs = (
+        tqdm(
+            remaining_specs,
+            desc=progress_desc,
+            unit="scene",
+            total=len(scene_specs),
+            initial=len(scenes),
+        )
+        if progress_desc
+        else remaining_specs
+    )
+    for scene_index, spec in enumerate(specs, start=len(scenes) + 1):
         try:
             segmented = adapter.segment_scene(spec["text"])
         except Exception as exc:  # Persist failures so interrupted jobs are inspectable.
@@ -288,10 +333,13 @@ def load_or_create_segmentation_cache(
                 "error": f"{type(exc).__name__}: {exc}",
             }
         scenes.append({**spec, **segmented})
+        if scene_index % checkpoint_interval == 0:
+            _atomic_pickle_dump({"metadata": metadata, "scenes": scenes}, path)
 
-    _atomic_pickle_dump(
-        {"metadata": _cache_metadata(adapter, scene_specs), "scenes": scenes}, path
-    )
+    if not scenes and not scene_specs:
+        _atomic_pickle_dump({"metadata": metadata, "scenes": scenes}, path)
+    elif scenes and len(scenes) % checkpoint_interval != 0:
+        _atomic_pickle_dump({"metadata": metadata, "scenes": scenes}, path)
     return scenes
 
 
