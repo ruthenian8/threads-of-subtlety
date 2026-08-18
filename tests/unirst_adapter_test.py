@@ -170,6 +170,21 @@ class UniRSTAdapterTest(unittest.TestCase):
         self.assertEqual(adapter.segmenter().predictor.model.encoder.calls, 1)
         self.assertEqual(FakeInternalParser.calls, 0)
 
+    def test_one_word_edu_advances_alignment_cursor(self):
+        boundaries = UniRSTAdapter._align_predicted_segments(
+            ["Formats", "that allow older cards"],
+            ["Formats", "that", "allow", "older", "cards"],
+        )
+
+        self.assertEqual(boundaries, [1, 5])
+
+    def test_alignment_rejects_boundary_inside_gold_token(self):
+        with self.assertRaisesRegex(ValueError, "ends inside a gold token"):
+            UniRSTAdapter._align_predicted_segments(
+                ["Format"],
+                ["Formats"],
+            )
+
     def test_single_edu_is_marked_none(self):
         result = {"rst": [Unit(text="Only EDU.")]}
         self.assertEqual(UniRSTAdapter.to_constituency_format(result, 1), "NONE")

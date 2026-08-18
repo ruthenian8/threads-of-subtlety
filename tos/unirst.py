@@ -95,6 +95,58 @@ class UniRSTAdapter:
         return normalised
 
     @staticmethod
+    def _align_predicted_segments(
+        predicted_segments: Sequence[str], gold_tokens: Sequence[str]
+    ) -> List[int]:
+        """Map predicted segment lengths to exclusive gold-token boundaries.
+
+        UniRST's ``DUConverter.fix_segmented_strings`` can move its token
+        cursor backwards when a predicted EDU consists of exactly one word,
+        after which its unbounded alignment loop never makes progress.  This
+        bounded implementation requires every EDU to consume at least one
+        complete gold token and fails explicitly on an unalignable boundary.
+        """
+        boundaries: List[int] = []
+        start_token = 0
+
+        for segment_index, segment in enumerate(predicted_segments):
+            target_length = len("".join(segment.split()))
+            if target_length == 0:
+                raise ValueError(f"Predicted EDU {segment_index} is empty")
+            if start_token >= len(gold_tokens):
+                raise ValueError(
+                    f"Predicted EDU {segment_index} starts after all gold tokens"
+                )
+
+            candidate_length = 0
+            end_token = start_token
+            while end_token < len(gold_tokens) and candidate_length < target_length:
+                candidate_length += len("".join(gold_tokens[end_token].split()))
+                end_token += 1
+
+            if candidate_length < target_length:
+                raise ValueError(
+                    f"Unable to align predicted EDU {segment_index}: requires "
+                    f"{target_length} non-whitespace characters, but only "
+                    f"{candidate_length} remain"
+                )
+            if candidate_length != target_length:
+                raise ValueError(
+                    f"Predicted EDU {segment_index} ends inside a gold token: "
+                    f"expected {target_length} non-whitespace characters, "
+                    f"reached {candidate_length}"
+                )
+
+            boundaries.append(end_token)
+            start_token = end_token
+
+        if start_token != len(gold_tokens):
+            raise ValueError(
+                f"Segmentation left {len(gold_tokens) - start_token} gold tokens unused"
+            )
+        return boundaries
+
+    @staticmethod
     def _segment_with_unirst_predictor(predictor: Any, text: str) -> List[str]:
         """Run UniRST's learned EDU segmenter without decoding an RST tree.
 
@@ -109,7 +161,6 @@ class UniRSTAdapter:
             import razdel
             import torch
             from isanlp_rst.universal_parser.src.parser.data import Data
-            from isanlp_rst.utils.du_converter import DUConverter
         except ImportError as exc:  # pragma: no cover - installation failure
             raise RuntimeError(
                 "UniRST segmentation requires razdel, torch, and isanlp_rst"
@@ -119,17 +170,10 @@ class UniRSTAdapter:
         encoder = getattr(model, "encoder", None)
         tokenizer = getattr(predictor, "tokenizer", None)
         tokenize = getattr(predictor, "tokenize", None)
-        remap_offsets = getattr(predictor, "remap_tree_offsets", None)
-        build_offsets = getattr(predictor, "build_offset_converter_from_words", None)
         if not callable(encoder) or tokenizer is None or not callable(tokenize):
             raise RuntimeError(
                 "The installed isanlp_rst version does not expose the "
                 "universal parser segmentation components expected by this adapter"
-            )
-        if not callable(remap_offsets) or not callable(build_offsets):
-            raise RuntimeError(
-                "The installed isanlp_rst version cannot align segmented EDUs "
-                "back to the original text"
             )
 
         razdel_tokens = list(razdel.tokenize(text))
@@ -186,23 +230,31 @@ class UniRSTAdapter:
                 "UniRST returned invalid or incomplete predicted EDU boundaries"
             )
 
-        # This is the same subword-to-word alignment used by parse_rst(), but
-        # applied only to EDU leaves; no discourse tree is constructed.
+        # Align subword segments to complete Razdel tokens with a bounded
+        # cursor, then slice the original scene so punctuation and whitespace
+        # are preserved without invoking DUConverter's unbounded loop.
         subword_tokens = tokenizer.convert_ids_to_tokens(input_ids)
-        converter = DUConverter({}, tokenization_type="default")
-        units = converter._lists_to_isanlp_format(  # noqa: SLF001
-            subword_tokens,
-            predicted_breaks,
-            gold_tokens=word_tokens,
+        predicted_segments: List[str] = []
+        previous_break = 0
+        for predicted_break in predicted_breaks:
+            predicted_segments.append(
+                "".join(subword_tokens[previous_break : predicted_break + 1])
+                .replace("▁", " ")
+                .strip()
+            )
+            previous_break = predicted_break + 1
+
+        word_boundaries = UniRSTAdapter._align_predicted_segments(
+            predicted_segments, word_tokens
         )
-        offset_positions, original_offsets = build_offsets(
-            text,
-            word_tokens,
-            word_offsets,
-        )
-        for unit in units:
-            remap_offsets(unit, offset_positions, original_offsets, text)
-        return [unit.text for unit in units]
+        edus: List[str] = []
+        start_token = 0
+        for end_token in word_boundaries:
+            start_character = word_offsets[start_token][0]
+            end_character = word_offsets[end_token - 1][1]
+            edus.append(text[start_character:end_character])
+            start_token = end_token
+        return edus
 
     def _segment_edus(self, text: str) -> List[str]:
         parser = self.segmenter()
