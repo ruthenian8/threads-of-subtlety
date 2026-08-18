@@ -1,6 +1,8 @@
 accelerate
 datasets
 evaluate
+isanlp_rst @ git+https://github.com/tchewik/isanlp_rst.git@master
+isanlp @ git+https://github.com/iinemo/isanlp.git
 pydantic
 rich
 scikit-learn

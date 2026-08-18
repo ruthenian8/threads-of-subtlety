@@ -5,8 +5,14 @@ import evaluate
 import networkx as nx
 import numpy as np
 from rich.progress import track
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-metric = evaluate.combine(["accuracy", "f1", "precision", "recall"])
+try:
+    metric = evaluate.combine(["accuracy", "f1", "precision", "recall"])
+except (FileNotFoundError, OSError, RuntimeError):
+    # Recent evaluate versions no longer ship the metric scripts locally.  Do
+    # not make importing the preprocessing pipeline depend on network access.
+    metric = None
 
 
 def split_list_into_n_chunks(a, n):
@@ -71,7 +77,14 @@ def load_graph_motifs(path: str) -> Dict[str, nx.Graph]:
 def compute_metrics(eval_pred):
     predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=1)
-    return metric.compute(predictions=predictions, references=labels)
+    if metric is not None:
+        return metric.compute(predictions=predictions, references=labels)
+    return {
+        "accuracy": accuracy_score(labels, predictions),
+        "f1": f1_score(labels, predictions, zero_division=0),
+        "precision": precision_score(labels, predictions, zero_division=0),
+        "recall": recall_score(labels, predictions, zero_division=0),
+    }
 
 
 def load_json(path: str):
