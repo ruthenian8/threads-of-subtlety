@@ -3,19 +3,40 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import glob
 import os
 import random
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
-from tqdm.contrib.concurrent import process_map
+from tqdm.auto import tqdm
 
 from tos.tos_dataset import DiscourseMotifDists, Document, ToSDataset
 from tos.tos_utils import load_json
 
 
 random.seed(42)
+
+
+_WORKER_MOTIFS: Optional[Dict[int, List]] = None
+
+
+def _init_motif_worker(motifs: Dict[int, List]) -> None:
+    """Initialize motif collections once in each process-pool worker."""
+    global _WORKER_MOTIFS
+    _WORKER_MOTIFS = motifs
+
+
+def _add_motif_dist_to_document_worker(document: Document) -> Document:
+    if _WORKER_MOTIFS is None:
+        raise RuntimeError("motif worker was not initialized")
+    return add_motif_dist_to_document(
+        document,
+        _WORKER_MOTIFS[3],
+        _WORKER_MOTIFS[6],
+        _WORKER_MOTIFS[9],
+    )
 
 
 def add_motif_dist_to_document(
@@ -71,15 +92,24 @@ def main() -> None:
     )
     for file_path in sorted(files):
         dataset = ToSDataset.load_document_corpus(file_path)
-        dataset = process_map(
-            add_motif_dist_to_document,
-            dataset,
-            [motifs[3]] * len(dataset),
-            [motifs[6]] * len(dataset),
-            [motifs[9]] * len(dataset),
+        # Motifs are sent once per worker through the initializer instead of
+        # being serialized in every document task.
+        with ProcessPoolExecutor(
             max_workers=args.workers,
-            chunksize=1,
-        )
+            initializer=_init_motif_worker,
+            initargs=(motifs,),
+        ) as executor:
+            dataset = list(
+                tqdm(
+                    executor.map(
+                        _add_motif_dist_to_document_worker,
+                        dataset,
+                        chunksize=1,
+                    ),
+                    total=len(dataset),
+                    desc=os.path.basename(file_path),
+                )
+            )
         output_path = f"{file_path[:-6]}.motif_dists.jsonl"
         ToSDataset.save_dataset_as_jsonl(dataset, output_path)
         print(f"wrote {output_path}")
@@ -87,4 +117,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

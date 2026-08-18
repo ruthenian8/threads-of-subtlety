@@ -11,6 +11,7 @@ owns a separate segmentation pickle and output shard.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import re
 from collections import defaultdict
@@ -421,7 +422,10 @@ def main() -> None:
         cuda_device=args.gpu_id if torch.cuda.is_available() else -1,
     )
 
-    if not args.skip_hc3:
+    # HC3 is not sharded across workers, so only the designated worker may
+    # process it during a multi-GPU MAGE run.  This avoids duplicate parsing
+    # and concurrent writes to the shared HC3 cache and output files.
+    if not args.skip_hc3 and args.gpu_id == 0:
         for source, documents in hc3_groups(args.hc3_dataset, splitter, args.min_char_len).items():
             run_group(
                 documents,
