@@ -178,6 +178,30 @@ class UniRSTAdapterTest(unittest.TestCase):
 
         self.assertEqual(boundaries, [1, 5])
 
+    def test_du_converter_replacement_handles_one_word_edu(self):
+        fixed = UniRSTAdapter._fix_segmented_strings(
+            ["Formats", "that allow older cards"],
+            ["Formats", "that", "allow", "older", "cards"],
+        )
+
+        self.assertEqual(fixed, ["Formats", "that allow older cards"])
+
+    def test_production_parser_installs_bounded_du_converter(self):
+        from isanlp_rst.utils.du_converter import DUConverter
+
+        original = DUConverter.__dict__["fix_segmented_strings"]
+        try:
+            UniRSTAdapter._install_du_converter_alignment_fix()
+
+            fixed = DUConverter.fix_segmented_strings(
+                ["Formats", "that allow older cards"],
+                ["Formats", "that", "allow", "older", "cards"],
+            )
+        finally:
+            DUConverter.fix_segmented_strings = original
+
+        self.assertEqual(fixed, ["Formats", "that allow older cards"])
+
     def test_alignment_rejects_boundary_inside_gold_token(self):
         with self.assertRaisesRegex(ValueError, "ends inside a gold token"):
             UniRSTAdapter._align_predicted_segments(

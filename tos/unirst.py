@@ -59,8 +59,24 @@ class UniRSTAdapter:
         if self._parser_factory is None:
             from isanlp_rst.parser import Parser
 
+            self._install_du_converter_alignment_fix()
             self._parser_factory = Parser
         return self._parser_factory
+
+    @staticmethod
+    def _install_du_converter_alignment_fix() -> None:
+        """Replace UniRST's non-terminating EDU text alignment globally.
+
+        Both ``parse_rst`` and ``parse_from_edus`` instantiate ``DUConverter``
+        after inference.  Until the upstream implementation is fixed, install
+        the bounded equivalent before constructing a production parser so the
+        parsing phase cannot enter the same one-word-EDU loop as segmentation.
+        """
+        from isanlp_rst.utils.du_converter import DUConverter
+
+        DUConverter.fix_segmented_strings = staticmethod(
+            UniRSTAdapter._fix_segmented_strings
+        )
 
     def make_parser(self, relinventory: str) -> Any:
         """Create one parser for a single relation inventory."""
@@ -145,6 +161,21 @@ class UniRSTAdapter:
                 f"Segmentation left {len(gold_tokens) - start_token} gold tokens unused"
             )
         return boundaries
+
+    @staticmethod
+    def _fix_segmented_strings(
+        predicted_segments: Sequence[str], gold_tokens: Sequence[str]
+    ) -> List[str]:
+        """Return gold-token text grouped by bounded predicted boundaries."""
+        boundaries = UniRSTAdapter._align_predicted_segments(
+            predicted_segments, gold_tokens
+        )
+        fixed_segments: List[str] = []
+        start_token = 0
+        for end_token in boundaries:
+            fixed_segments.append(" ".join(gold_tokens[start_token:end_token]).strip())
+            start_token = end_token
+        return fixed_segments
 
     @staticmethod
     def _segment_with_unirst_predictor(predictor: Any, text: str) -> List[str]:
