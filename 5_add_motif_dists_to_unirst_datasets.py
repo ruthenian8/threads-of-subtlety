@@ -13,7 +13,11 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from tos.tos_dataset import DiscourseMotifDists, Document, ToSDataset
-from tos.tos_utils import load_json
+from tos.tos_utils import (
+    load_json,
+    resolve_selected_motif_hashes,
+    validate_selected_motif_hashes,
+)
 
 
 random.seed(42)
@@ -73,15 +77,25 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default="data/unirst")
     parser.add_argument("--motif-dir", default="data/motifs")
+    parser.add_argument("--dataset-name", default="hc3-mage")
+    parser.add_argument(
+        "--selected-hashes",
+        default=None,
+        help="Selection manifest; generated manifest is preferred by default.",
+    )
     parser.add_argument("--workers", type=int, default=14)
     args = parser.parse_args()
 
-    selected = load_json(
-        os.path.join(args.motif_dir, "hc3-mage_selected-motif-hashes.json")
+    selected_manifest = resolve_selected_motif_hashes(
+        args.motif_dir, args.dataset_name, args.selected_hashes
+    )
+    selected = load_json(selected_manifest)
+    validate_selected_motif_hashes(
+        args.motif_dir, selected, dataset_name=args.dataset_name
     )
     motifs = {
         size: ToSDataset.load_motifs(
-            os.path.join(args.motif_dir, f"hc3-mage_M{size}_motifs.json"),
+            os.path.join(args.motif_dir, f"{args.dataset_name}_M{size}_motifs.json"),
             selected[f"m{size}"],
         )
         for size in (3, 6, 9)

@@ -38,10 +38,30 @@ python 0_prepare_and_parse_datasets_unirst.py \
   --total-gpus 1 --gpu-id 0 --output-dir data/unirst
 ```
 
-Then add discourse graphs and motif distributions:
+Then add discourse graphs:
 
 ```bash
 python 1_add_graphs_to_unirst_datasets.py --root data/unirst
+```
+
+If the motif definitions are being regenerated from the current UniRST graph
+outputs, use the same root and motif directory for the triad stages:
+
+```bash
+python 2_extract_single_triads.py --root data/unirst --motif-dir data/motifs
+python 3_extract_double_triads.py --root data/unirst --motif-dir data/motifs
+python 4_extract_triple_triads.py --motif-dir data/motifs
+```
+
+The final triad command also writes
+`data/motifs/hc3-mage_selected-motif-hashes.generated.json`, selecting hashes
+from the regenerated motif files. The motif-distribution stage prefers this
+matching manifest automatically; pass `--selected-hashes` to use a curated
+manifest instead. A stale manifest is rejected with an actionable error.
+
+Finally, add motif distributions to the graph outputs:
+
+```bash
 python 5_add_motif_dists_to_unirst_datasets.py --root data/unirst
 ```
 

@@ -22,7 +22,12 @@ from transformers import (
 )
 from transformers.tokenization_utils_base import PaddingStrategy
 
-from .tos_utils import load_json, split_list_into_n_chunks
+from .tos_utils import (
+    load_json,
+    resolve_selected_motif_hashes,
+    split_list_into_n_chunks,
+    validate_selected_motif_hashes,
+)
 
 random.seed(42)
 
@@ -68,8 +73,10 @@ class ToSDataset:
         self.gpu_id = gpu_id
         self.motif_dir = motif_dir
         if self.motif_dir:
-            self.selected_hashes = load_json(
-                os.path.join(self.motif_dir, "hc3-mage_selected-motif-hashes.json")
+            selected_manifest = resolve_selected_motif_hashes(self.motif_dir)
+            self.selected_hashes = load_json(selected_manifest)
+            validate_selected_motif_hashes(
+                self.motif_dir, self.selected_hashes
             )
             self.m3_motifs = ToSDataset.load_motifs(
                 os.path.join(self.motif_dir, "hc3-mage_M3_motifs.json"),

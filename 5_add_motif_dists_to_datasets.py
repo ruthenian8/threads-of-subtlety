@@ -9,12 +9,18 @@ import networkx as nx
 from tqdm.contrib.concurrent import process_map
 
 from tos.tos_dataset import DiscourseMotifDists, Document, ToSDataset
-from tos.tos_utils import load_json
+from tos.tos_utils import (
+    load_json,
+    resolve_selected_motif_hashes,
+    validate_selected_motif_hashes,
+)
 
 random.seed(42)
 
 
-selected_motif_hashes = load_json("data/motifs/hc3-mage_selected-motif-hashes.json")
+selected_manifest = resolve_selected_motif_hashes("data/motifs")
+selected_motif_hashes = load_json(selected_manifest)
+validate_selected_motif_hashes("data/motifs", selected_motif_hashes)
 
 m3_motifs = ToSDataset.load_motifs(
     "data/motifs/hc3-mage_M3_motifs.json", selected_motif_hashes["m3"]

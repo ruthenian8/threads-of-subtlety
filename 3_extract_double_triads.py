@@ -1,16 +1,21 @@
+import argparse
+from concurrent.futures import ProcessPoolExecutor
+import os
 from glob import glob
 from itertools import combinations
 
 import networkx as nx
-from tqdm.contrib.concurrent import process_map
+from tqdm.auto import tqdm
 
 from tos.tos_dataset import ToSDataset
 from tos.tos_utils import is_motif_present, load_graph_motifs, save_graph_motifs
 
-single_triads_path = "data/motifs/hc3-mage_M3_motifs.json"
-motifs_three = load_graph_motifs(single_triads_path).values()
-motifs_three = [nx.convert_node_labels_to_integers(m) for m in motifs_three]
-print(f"no. of motifs_three: {len(motifs_three)}")
+motifs_three = []
+
+
+def init_motif_worker(motifs):
+    global motifs_three
+    motifs_three = motifs
 
 
 def extract_double_motifs(sample):
@@ -49,14 +54,29 @@ def extract_double_motifs(sample):
 
 
 if __name__ == "__main__":
-    # hc3_file_paths = glob("data/hc3/*.graph_added.jsonl")
-    # hc3_dataset = tos_dataset.load_datasets(hc3_file_paths)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", default="data/unirst")
+    parser.add_argument("--motif-dir", default="data/motifs")
+    parser.add_argument("--dataset-name", default="hc3-mage")
+    parser.add_argument("--max-per-file", type=int, default=15000)
+    parser.add_argument("--workers", type=int, default=12)
+    args = parser.parse_args()
 
-    mage_file_paths = glob("data/mage/*.graph_added.jsonl")
-    mage_dataset = ToSDataset.load_datasets(mage_file_paths, max_per_file=15000)
+    single_triads_path = os.path.join(
+        args.motif_dir, f"{args.dataset_name}_M3_motifs.json"
+    )
+    motifs_three = load_graph_motifs(single_triads_path).values()
+    motifs_three = [nx.convert_node_labels_to_integers(m) for m in motifs_three]
+    print(f"no. of motifs_three: {len(motifs_three)}")
 
-    # dataset = hc3_dataset + mage_dataset
-    dataset = mage_dataset
+    file_paths = sorted(
+        glob(os.path.join(args.root, "rel-*", "*.discourse_parsed.graph_added.jsonl"))
+    )
+    if not file_paths:
+        raise FileNotFoundError(
+            f"No graph-added UniRST files found below {args.root!r}"
+        )
+    dataset = ToSDataset.load_datasets(file_paths, max_per_file=args.max_per_file)
 
     all_graphs = []
     for document in dataset:
@@ -64,9 +84,18 @@ if __name__ == "__main__":
             all_graphs.append(tree.graph_networkx)
     print(f"no. of all_graphs: {len(all_graphs)}")
 
-    results = process_map(
-        extract_double_motifs, all_graphs, max_workers=12, chunksize=1
-    )
+    with ProcessPoolExecutor(
+        max_workers=args.workers,
+        initializer=init_motif_worker,
+        initargs=(motifs_three,),
+    ) as executor:
+        results = list(
+            tqdm(
+                executor.map(extract_double_motifs, all_graphs, chunksize=1),
+                total=len(all_graphs),
+                desc="extracting double motifs",
+            )
+        )
 
     double_motifs = {}
     for res in results:
@@ -74,4 +103,9 @@ if __name__ == "__main__":
             double_motifs[sg_hash] = motif
     print(len(double_motifs))
 
-    save_graph_motifs(6, double_motifs.values(), "mage")
+    save_graph_motifs(
+        6,
+        double_motifs.values(),
+        args.dataset_name,
+        output_dir=args.motif_dir,
+    )

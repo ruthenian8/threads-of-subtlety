@@ -1,5 +1,5 @@
-import json
-import random
+import argparse
+import os
 from glob import glob
 from itertools import combinations
 from multiprocessing import Manager, Pool
@@ -34,14 +34,27 @@ def worker_function(G):
     return "P"
 
 
-if __name__ == "__main__":
-    hc3_file_paths = glob("data/hc3/*.graph_added.jsonl")
-    hc3_dataset = ToSDataset.load_datasets(hc3_file_paths)
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--root",
+        default="data/unirst",
+        help="Dataset root containing rel-*/...graph_added.jsonl files.",
+    )
+    parser.add_argument("--motif-dir", default="data/motifs")
+    parser.add_argument("--dataset-name", default="hc3-mage")
+    parser.add_argument("--max-per-file", type=int, default=15000)
+    parser.add_argument("--workers", type=int, default=None)
+    args = parser.parse_args()
 
-    mage_file_paths = glob("data/mage/*.graph_added.jsonl")
-    mage_dataset = ToSDataset.load_datasets(mage_file_paths, max_per_file=15000)
-
-    dataset = hc3_dataset + mage_dataset
+    file_paths = sorted(
+        glob(os.path.join(args.root, "rel-*", "*.discourse_parsed.graph_added.jsonl"))
+    )
+    if not file_paths:
+        raise FileNotFoundError(
+            f"No graph-added UniRST files found below {args.root!r}"
+        )
+    dataset = ToSDataset.load_datasets(file_paths, max_per_file=args.max_per_file)
 
     motif_size = 3
 
@@ -53,7 +66,10 @@ if __name__ == "__main__":
 
     with Manager() as manager:
         manager_list = manager.list()
-        with Pool(initializer=init_globals, initargs=(manager_list,)) as pool:
+        pool_kwargs = {"initializer": init_globals, "initargs": (manager_list,)}
+        if args.workers is not None:
+            pool_kwargs["processes"] = args.workers
+        with Pool(**pool_kwargs) as pool:
             results = list(
                 tqdm(pool.imap(worker_function, all_graphs), total=len(all_graphs))
             )
@@ -61,4 +77,13 @@ if __name__ == "__main__":
         print("Shared list:", motifs)
         print("len:", len(motifs))
 
-    save_graph_motifs(motif_size, motifs, "hc3-mage")
+    save_graph_motifs(
+        motif_size,
+        motifs,
+        args.dataset_name,
+        output_dir=args.motif_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()

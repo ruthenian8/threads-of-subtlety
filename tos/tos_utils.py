@@ -1,4 +1,5 @@
 import json
+import os
 from typing import Dict
 
 import evaluate
@@ -41,7 +42,13 @@ def is_isomorphic_multiple(graphs, candidate_graph) -> bool:
     return False
 
 
-def save_graph_motifs(n_nodes, graphs, dataset_name, show_tracking=False):
+def save_graph_motifs(
+    n_nodes,
+    graphs,
+    dataset_name,
+    show_tracking=False,
+    output_dir="data/motifs",
+):
     # sanity check to remove isomorphic graphs
     non_iso_graphs = []
     for graph in track(
@@ -64,8 +71,85 @@ def save_graph_motifs(n_nodes, graphs, dataset_name, show_tracking=False):
         G_dict = nx.json_graph.node_link_data(G)
         non_iso_dict[iso_hash] = G_dict
 
-    with open(f"data/motifs/{dataset_name}_M{n_nodes}_motifs.json", "w") as f:
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, f"{dataset_name}_M{n_nodes}_motifs.json"), "w") as f:
         json.dump(non_iso_dict, f, indent=2)
+
+
+def write_selected_motif_hashes(
+    motif_dir: str,
+    dataset_name: str = "hc3-mage",
+    sizes=(3, 6, 9),
+    output_path: str = None,
+) -> str:
+    """Write a selection manifest matching the currently saved motif files.
+
+    Regenerated motifs have different Weisfeiler-Lehman hashes from the
+    checked-in corpus, so the old curated manifest cannot safely be reused.
+    The generated manifest deliberately selects every motif; users can curate
+    it afterward without changing the motif files.
+    """
+    manifest = {}
+    for size in sizes:
+        motif_path = os.path.join(motif_dir, f"{dataset_name}_M{size}_motifs.json")
+        with open(motif_path, encoding="utf-8") as handle:
+            motifs = json.load(handle)
+        manifest[f"m{size}"] = sorted(motifs)
+
+    output_path = output_path or os.path.join(
+        motif_dir, f"{dataset_name}_selected-motif-hashes.generated.json"
+    )
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    temporary_path = f"{output_path}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+    os.replace(temporary_path, output_path)
+    return output_path
+
+
+def resolve_selected_motif_hashes(
+    motif_dir: str, dataset_name: str = "hc3-mage", manifest_path: str = None
+) -> str:
+    """Prefer a generated manifest, falling back to the checked-in one."""
+    if manifest_path:
+        return manifest_path
+    generated_path = os.path.join(
+        motif_dir, f"{dataset_name}_selected-motif-hashes.generated.json"
+    )
+    if os.path.exists(generated_path):
+        return generated_path
+    return os.path.join(motif_dir, f"{dataset_name}_selected-motif-hashes.json")
+
+
+def validate_selected_motif_hashes(
+    motif_dir: str,
+    selected_hashes: Dict[str, list],
+    dataset_name: str = "hc3-mage",
+    sizes=(3, 6, 9),
+) -> None:
+    """Fail early with an actionable error when a manifest is stale."""
+    missing_by_size = {}
+    for size in sizes:
+        motif_path = os.path.join(motif_dir, f"{dataset_name}_M{size}_motifs.json")
+        with open(motif_path, encoding="utf-8") as handle:
+            available = set(json.load(handle))
+        selected = selected_hashes.get(f"m{size}")
+        if selected is None:
+            missing_by_size[f"m{size}"] = ["<missing manifest key>"]
+            continue
+        missing = sorted(set(selected) - available)
+        if missing:
+            missing_by_size[f"m{size}"] = missing
+    if missing_by_size:
+        details = ", ".join(
+            f"{size}: {len(hashes)} missing" for size, hashes in missing_by_size.items()
+        )
+        raise ValueError(
+            "Selected motif hashes do not match the motif files ("
+            f"{details}). Regenerate the selection manifest with "
+            "4_extract_triple_triads.py or pass --selected-hashes with a "
+            "matching manifest."
+        )
 
 
 def load_graph_motifs(path: str) -> Dict[str, nx.Graph]:
