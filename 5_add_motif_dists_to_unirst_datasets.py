@@ -7,6 +7,7 @@ from concurrent.futures import ProcessPoolExecutor
 import glob
 import os
 import random
+import re
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -76,7 +77,12 @@ def add_motif_dist_to_document(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default="data/unirst")
-    parser.add_argument("--motif-dir", default="data/motifs")
+    parser.add_argument("--motif-dir", default=None)
+    parser.add_argument(
+        "--relinventory",
+        default=None,
+        help="Process one RST inventory with its standard-specific motif set.",
+    )
     parser.add_argument("--dataset-name", default="hc3-mage")
     parser.add_argument(
         "--selected-hashes",
@@ -86,47 +92,73 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=14)
     args = parser.parse_args()
 
-    selected_manifest = resolve_selected_motif_hashes(
-        args.motif_dir, args.dataset_name, args.selected_hashes
-    )
-    selected = load_json(selected_manifest)
-    validate_selected_motif_hashes(
-        args.motif_dir, selected, dataset_name=args.dataset_name
-    )
-    motifs = {
-        size: ToSDataset.load_motifs(
-            os.path.join(args.motif_dir, f"{args.dataset_name}_M{size}_motifs.json"),
-            selected[f"m{size}"],
-        )
-        for size in (3, 6, 9)
-    }
+    inventories = [args.relinventory] if args.relinventory else [None]
+    if args.relinventory is None:
+        inventory_dirs = sorted(glob.glob(os.path.join(args.root, "rel-*")))
+        inventories = [
+            os.path.basename(path)[len("rel-") :]
+            for path in inventory_dirs
+            if os.path.isdir(path)
+        ] or [None]
 
-    files = glob.glob(
-        os.path.join(args.root, "rel-*", "*.discourse_parsed.graph_added.jsonl")
-    )
-    for file_path in sorted(files):
-        dataset = ToSDataset.load_document_corpus(file_path)
-        # Motifs are sent once per worker through the initializer instead of
-        # being serialized in every document task.
-        with ProcessPoolExecutor(
-            max_workers=args.workers,
-            initializer=_init_motif_worker,
-            initargs=(motifs,),
-        ) as executor:
-            dataset = list(
-                tqdm(
-                    executor.map(
-                        _add_motif_dist_to_document_worker,
-                        dataset,
-                        chunksize=1,
-                    ),
-                    total=len(dataset),
-                    desc=os.path.basename(file_path),
-                )
+    for relinventory in inventories:
+        inventory_name = (
+            re.sub(r"[^A-Za-z0-9_.-]+", "_", relinventory)
+            if relinventory
+            else None
+        )
+        motif_dir = (
+            os.path.join(args.motif_dir, inventory_name)
+            if args.motif_dir and args.relinventory is None and inventory_name
+            else args.motif_dir
+            or (os.path.join("data/motifs", inventory_name) if inventory_name else "data/motifs")
+        )
+        selected_manifest = resolve_selected_motif_hashes(
+            motif_dir, args.dataset_name, args.selected_hashes
+        )
+        selected = load_json(selected_manifest)
+        validate_selected_motif_hashes(
+            motif_dir, selected, dataset_name=args.dataset_name
+        )
+        motifs = {
+            size: ToSDataset.load_motifs(
+                os.path.join(
+                    motif_dir, f"{args.dataset_name}_M{size}_motifs.json"
+                ),
+                selected[f"m{size}"],
             )
-        output_path = f"{file_path[:-6]}.motif_dists.jsonl"
-        ToSDataset.save_dataset_as_jsonl(dataset, output_path)
-        print(f"wrote {output_path}")
+            for size in (3, 6, 9)
+        }
+
+        inventory_dir = f"rel-{inventory_name}" if inventory_name else "rel-*"
+        files = glob.glob(
+            os.path.join(
+                args.root, inventory_dir, "*.discourse_parsed.graph_added.jsonl"
+            )
+        )
+        for file_path in sorted(files):
+            dataset = ToSDataset.load_document_corpus(file_path)
+            # Motifs are sent once per worker through the initializer instead of
+            # being serialized in every document task.
+            with ProcessPoolExecutor(
+                max_workers=args.workers,
+                initializer=_init_motif_worker,
+                initargs=(motifs,),
+            ) as executor:
+                dataset = list(
+                    tqdm(
+                        executor.map(
+                            _add_motif_dist_to_document_worker,
+                            dataset,
+                            chunksize=1,
+                        ),
+                        total=len(dataset),
+                        desc=os.path.basename(file_path),
+                    )
+                )
+            output_path = f"{file_path[:-6]}.motif_dists.jsonl"
+            ToSDataset.save_dataset_as_jsonl(dataset, output_path)
+            print(f"wrote {output_path}")
 
 
 if __name__ == "__main__":

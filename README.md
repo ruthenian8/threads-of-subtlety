@@ -44,26 +44,43 @@ Then add discourse graphs:
 python 1_add_graphs_to_unirst_datasets.py --root data/unirst
 ```
 
-If the motif definitions are being regenerated from the current UniRST graph
-outputs, use the same root and motif directory for the triad stages:
+If the motif definitions are being regenerated, each RST inventory is processed
+independently. This creates separate motif files and manifests per standard:
 
 ```bash
-python 2_extract_single_triads.py --root data/unirst --motif-dir data/motifs
-python 3_extract_double_triads.py --root data/unirst --motif-dir data/motifs
-python 4_extract_triple_triads.py --motif-dir data/motifs
+for relinventory in eng.erst.gum eng.rst.rstdt deu.rst.pcc nld.rst.nldt; do
+  motif_dir="data/motifs/${relinventory}"
+  python 2_extract_single_triads.py \
+    --root data/unirst --relinventory "$relinventory" --motif-dir "$motif_dir"
+  python 3_extract_double_triads.py \
+    --root data/unirst --relinventory "$relinventory" --motif-dir "$motif_dir"
+  python 4_extract_triple_triads.py --motif-dir "$motif_dir"
+done
 ```
 
-The final triad command also writes
-`data/motifs/hc3-mage_selected-motif-hashes.generated.json`, selecting hashes
-from the regenerated motif files. The motif-distribution stage prefers this
-matching manifest automatically; pass `--selected-hashes` to use a curated
-manifest instead. A stale manifest is rejected with an actionable error.
+Each final triad command writes a matching
+`hc3-mage_selected-motif-hashes.generated.json`. The distribution stage can
+then be run once per standard:
 
-Finally, add motif distributions to the graph outputs:
+```text
+data/motifs/
+├── eng.erst.gum/
+├── eng.rst.rstdt/
+├── deu.rst.pcc/
+└── nld.rst.nldt/
+```
 
 ```bash
-python 5_add_motif_dists_to_unirst_datasets.py --root data/unirst
+for relinventory in eng.erst.gum eng.rst.rstdt deu.rst.pcc nld.rst.nldt; do
+  python 5_add_motif_dists_to_unirst_datasets.py \
+    --root data/unirst --relinventory "$relinventory" \
+    --motif-dir "data/motifs/${relinventory}"
+done
 ```
+
+The generated manifest selects hashes from that standard's motif files.
+Pass `--selected-hashes` to use a curated manifest instead; stale manifests
+are rejected with an actionable error.
 
 The preparation script supports `--output-mode separate`, `paired`, or
 `both`; `both` is the default. It also supports `--force-segmentation` when a
