@@ -470,7 +470,11 @@ class ToSDataset:
     def calculate_motif_distribution(
         G: nx.DiGraph, graph_motifs: List[nx.DiGraph], root_label: str
     ) -> Dict[str, np.ndarray]:
-        G_diameter = nx.diameter(G.to_undirected())
+        undirected = G.to_undirected()
+        G_diameter = nx.diameter(undirected)
+        root_distances = nx.single_source_shortest_path_length(
+            undirected, root_label
+        )
         hist = np.zeros(len(graph_motifs), dtype=float)
         wad = np.zeros(len(graph_motifs), dtype=float)
 
@@ -481,37 +485,30 @@ class ToSDataset:
             if motif.number_of_nodes() == 2:
                 hist[index] = G.number_of_edges()
                 continue
+            if (
+                motif.number_of_nodes() > G.number_of_nodes()
+                or motif.number_of_edges() > G.number_of_edges()
+            ):
+                wad[index] = -1
+                continue
 
             DiGM = nx.algorithms.isomorphism.DiGraphMatcher(
                 G, motif, edge_match=lambda e1, e2: e1["label_0"] == e2["label_0"]
             )
 
-            counts_per_depth = {}
+            total_depth = 0.0
 
             for subgraph in DiGM.subgraph_isomorphisms_iter():
                 # subgraph e.g.: {'span_1-31': 'span_21-24', 'span_29-31': 'span_23-24', 'span_31-31': 'span_24-24'}, <dict>
                 motif_nodes = subgraph.keys()
                 motif_depth = np.mean(
-                    [
-                        nx.shortest_path_length(
-                            G.to_undirected(), source=root_label, target=node_label
-                        )
-                        for node_label in motif_nodes
-                    ]
+                    [root_distances[node_label] for node_label in motif_nodes]
                 )
-                if motif_depth not in counts_per_depth:
-                    counts_per_depth[motif_depth] = 1
-                else:
-                    counts_per_depth[motif_depth] += 1
-
+                total_depth += motif_depth
                 hist[index] += 1
 
-            counts_x_depths = np.sum(
-                [depth * counts for depth, counts in counts_per_depth.items()]
-            )
-
             # sum(depth x count) / sum(count)
-            wad[index] = counts_x_depths / hist[index] if hist[index] > 0 else -1
+            wad[index] = total_depth / hist[index] if hist[index] > 0 else -1
 
         num_of_motifs = np.sum(hist)
         motif_freqs = hist / num_of_motifs if num_of_motifs > 0 else hist

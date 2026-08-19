@@ -82,6 +82,13 @@ The generated manifest selects hashes from that standard's motif files.
 Pass `--selected-hashes` to use a curated manifest instead; stale manifests
 are rejected with an actionable error.
 
+To compare the optimized exact motif operations with their original reference
+implementations on deterministic synthetic graphs, run:
+
+```bash
+PYTHONPATH=. python benchmarks/benchmark_motifs.py --nodes 40 --repeats 3
+```
+
 The preparation script supports `--output-mode separate`, `paired`, or
 `both`; `both` is the default. It also supports `--force-segmentation` when a
 segmentation cache must be regenerated.

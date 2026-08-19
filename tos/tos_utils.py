@@ -1,5 +1,6 @@
 import json
 import os
+from itertools import combinations
 from typing import Dict
 
 import evaluate
@@ -42,6 +43,38 @@ def is_isomorphic_multiple(graphs, candidate_graph) -> bool:
     return False
 
 
+def connected_three_node_subgraphs(graph):
+    """Yield each connected induced three-node subgraph exactly once.
+
+    Every connected three-node undirected graph has a node adjacent to the
+    other two, so enumerating neighbor pairs avoids the cubic all-node scan.
+    Direction and edge labels are retained in the induced subgraph.
+    """
+    undirected = graph.to_undirected(as_view=True)
+    seen = set()
+    for center in undirected:
+        for left, right in combinations(undirected.neighbors(center), 2):
+            nodes = frozenset((center, left, right))
+            if nodes in seen:
+                continue
+            seen.add(nodes)
+            yield graph.subgraph(nodes).copy()
+
+
+def deduplicate_graph_motifs(graphs):
+    """Deduplicate motifs with WL hash buckets and exact collision checks."""
+    buckets = {}
+    unique = []
+    for graph in graphs:
+        motif_hash = nx.weisfeiler_lehman_graph_hash(graph, edge_attr="label_0")
+        bucket = buckets.setdefault(motif_hash, [])
+        if is_isomorphic_multiple(bucket, graph):
+            continue
+        bucket.append(graph)
+        unique.append(graph)
+    return unique
+
+
 def save_graph_motifs(
     n_nodes,
     graphs,
@@ -49,16 +82,17 @@ def save_graph_motifs(
     show_tracking=False,
     output_dir="data/motifs",
 ):
-    # sanity check to remove isomorphic graphs
-    non_iso_graphs = []
-    for graph in track(
-        graphs,
-        description="Checking isomorphism",
-        disable=not show_tracking,
-        total=len(graphs),
-    ):
-        if not is_isomorphic_multiple(non_iso_graphs, graph):
-            non_iso_graphs.append(graph)
+    # Restrict exact isomorphism checks to WL-hash collision buckets instead
+    # of comparing every candidate against the full retained collection.
+    graph_list = list(graphs)
+    non_iso_graphs = deduplicate_graph_motifs(
+        track(
+            graph_list,
+            description="Checking isomorphism",
+            disable=not show_tracking,
+            total=len(graph_list),
+        )
+    )
 
     non_iso_dict = {}
     for G in track(

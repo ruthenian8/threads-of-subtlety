@@ -2,37 +2,21 @@ import argparse
 import os
 import re
 from glob import glob
-from itertools import combinations
-from multiprocessing import Manager, Pool
+from multiprocessing import Pool
 
-import networkx as nx
 from tqdm import tqdm
 
 from tos.tos_dataset import ToSDataset
-from tos.tos_utils import is_isomorphic_multiple, save_graph_motifs
-
-shared_list = None
-
-
-def init_globals(manager_list):
-    """Initializer for each child process to set the global shared_list."""
-    global shared_list
-    shared_list = manager_list
+from tos.tos_utils import (
+    connected_three_node_subgraphs,
+    deduplicate_graph_motifs,
+    save_graph_motifs,
+)
 
 
 def worker_function(G):
-    """
-    Checks if 'item' is in the shared_list.
-    If not found, appends it.
-    Returns a message for demonstration.
-    """
-    for SG in (G.subgraph(s).copy() for s in combinations(G, 3)):
-        if len(list(nx.isolates(SG))):
-            continue
-        if is_isomorphic_multiple(shared_list, SG):
-            continue
-        shared_list.append(SG)
-    return "P"
+    """Return motifs unique within one graph; the parent merges all workers."""
+    return deduplicate_graph_motifs(connected_three_node_subgraphs(G))
 
 
 def extract_inventory(args, relinventory: str) -> None:
@@ -58,15 +42,17 @@ def extract_inventory(args, relinventory: str) -> None:
     ]
     print(f"{relinventory}: no. of all_graphs: {len(all_graphs)}")
 
-    with Manager() as manager:
-        manager_list = manager.list()
-        pool_kwargs = {"initializer": init_globals, "initargs": (manager_list,)}
-        if args.workers is not None:
-            pool_kwargs["processes"] = args.workers
-        with Pool(**pool_kwargs) as pool:
-            list(tqdm(pool.imap(worker_function, all_graphs), total=len(all_graphs)))
-        motifs = list(manager_list)
-        print(f"{relinventory}: len: {len(motifs)}")
+    with Pool(processes=args.workers) as pool:
+        motifs = deduplicate_graph_motifs(
+            motif
+            for graph_motifs in tqdm(
+                pool.imap(worker_function, all_graphs, chunksize=args.chunksize),
+                total=len(all_graphs),
+                desc=f"extracting single motifs ({relinventory})",
+            )
+            for motif in graph_motifs
+        )
+    print(f"{relinventory}: len: {len(motifs)}")
 
     motif_dir = (
         os.path.join(args.motif_dir, inventory_name)
@@ -92,6 +78,7 @@ def main() -> None:
     )
     parser.add_argument("--max-per-file", type=int, default=15000)
     parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--chunksize", type=int, default=8)
     args = parser.parse_args()
 
     if args.relinventory:
