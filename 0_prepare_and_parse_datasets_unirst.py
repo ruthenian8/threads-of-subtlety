@@ -14,6 +14,7 @@ import argparse
 import gc
 import os
 import re
+import tempfile
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -273,11 +274,17 @@ def parse_predictions(
     on_inventory_complete: Optional[
         Callable[[str, Mapping[str, Mapping[str, Any]]], None]
     ] = None,
+    inventories: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     predictions: Dict[str, Dict[str, Any]] = {
         scene["scene_key"]: {} for scene in scenes
     }
-    for relinventory in adapter.relation_inventories:
+    selected_inventories = (
+        tuple(adapter.relation_inventories)
+        if inventories is None
+        else tuple(inventories)
+    )
+    for relinventory in selected_inventories:
         parser = adapter.make_parser(relinventory)
         try:
             for scene in tqdm(
@@ -331,6 +338,7 @@ def write_group_outputs(
     prefix: str,
     inventories: Sequence[str],
     output_mode: str,
+    overwrite: bool = False,
 ) -> None:
     scene_lookup = build_scene_lookup(scenes)
     for relinventory in inventories:
@@ -345,13 +353,11 @@ def write_group_outputs(
                 document_output(doc, scene_lookup, predictions, relinventory)
                 for doc in selected
             ]
-            write_jsonl_documents(
-                output_documents,
-                os.path.join(
-                    inventory_dir,
-                    f"{prefix}_{label_name}.discourse_parsed.jsonl",
-                ),
+            path = os.path.join(
+                inventory_dir, f"{prefix}_{label_name}.discourse_parsed.jsonl"
             )
+            if overwrite or not os.path.exists(path):
+                write_jsonl_documents(output_documents, path)
 
     if output_mode not in {"paired", "both"}:
         return
@@ -362,11 +368,85 @@ def write_group_outputs(
         if not selected:
             continue
         path = os.path.join(paired_dir, f"{prefix}_{label_name}.jsonl")
-        with open(path, "w", encoding="utf-8") as handle:
-            for document in selected:
-                handle.write(
-                    f"{paired_output(document, scene_lookup, predictions)}\n"
+        if not overwrite and os.path.exists(path):
+            continue
+        temporary_path = None
+        try:
+            fd, temporary_path = tempfile.mkstemp(
+                dir=paired_dir, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                for document in selected:
+                    handle.write(
+                        f"{paired_output(document, scene_lookup, predictions)}\n"
+                    )
+            os.replace(temporary_path, path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+
+
+def expected_group_output_paths(
+    documents: Sequence[Mapping[str, Any]],
+    output_dir: str,
+    prefix: str,
+    inventories: Sequence[str],
+    output_mode: str,
+) -> List[str]:
+    """Return the final artifact paths required for a group."""
+    labels = {
+        label_name
+        for label, label_name in ((1, "human"), (0, "machine"))
+        if any(document["label"] == label for document in documents)
+    }
+    paths: List[str] = []
+    if output_mode in {"separate", "both"}:
+        for relinventory in inventories:
+            inventory_dir = os.path.join(output_dir, f"rel-{safe_name(relinventory)}")
+            paths.extend(
+                os.path.join(
+                    inventory_dir,
+                    f"{prefix}_{label_name}.discourse_parsed.jsonl",
                 )
+                for label_name in sorted(labels)
+            )
+    if output_mode in {"paired", "both"}:
+        paths.extend(
+            os.path.join(output_dir, "paired", f"{prefix}_{label_name}.jsonl")
+            for label_name in sorted(labels)
+        )
+    return paths
+
+
+def inventories_with_missing_outputs(
+    documents: Sequence[Mapping[str, Any]],
+    output_dir: str,
+    prefix: str,
+    inventories: Sequence[str],
+) -> List[str]:
+    """Return inventories whose separate human/machine artifact is missing."""
+    labels = {
+        label_name
+        for label, label_name in ((1, "human"), (0, "machine"))
+        if any(document["label"] == label for document in documents)
+    }
+    missing: List[str] = []
+    for relinventory in inventories:
+        inventory_dir = os.path.join(output_dir, f"rel-{safe_name(relinventory)}")
+        paths = [
+            os.path.join(
+                inventory_dir,
+                f"{prefix}_{label_name}.discourse_parsed.jsonl",
+            )
+            for label_name in sorted(labels)
+        ]
+        if any(not os.path.exists(path) for path in paths):
+            missing.append(relinventory)
+    return missing
 
 
 def run_group(
@@ -378,9 +458,44 @@ def run_group(
     cache_name: str,
     force_segmentation: bool,
     output_mode: str,
+    force_parsing: bool = False,
 ) -> None:
     if not documents:
         return
+    inventories = tuple(adapter.relation_inventories)
+    expected_paths = expected_group_output_paths(
+        documents, output_dir, prefix, inventories, output_mode
+    )
+    force_outputs = force_segmentation or force_parsing
+    if not force_outputs and all(os.path.exists(path) for path in expected_paths):
+        tqdm.write(f"skipping {prefix}: all requested outputs exist")
+        return
+
+    missing_inventories = inventories_with_missing_outputs(
+        documents, output_dir, prefix, inventories
+    )
+    paired_paths = (
+        expected_group_output_paths(
+            documents, output_dir, prefix, (), "paired"
+        )
+        if output_mode in {"paired", "both"}
+        else []
+    )
+    paired_missing = any(not os.path.exists(path) for path in paired_paths)
+    if force_outputs or paired_missing:
+        inventories_to_parse = inventories
+    elif output_mode in {"separate", "both"}:
+        inventories_to_parse = tuple(missing_inventories)
+    else:
+        inventories_to_parse = ()
+    if not inventories_to_parse:
+        tqdm.write(f"skipping parsing for {prefix}: requested outputs exist")
+        return
+
+    if len(inventories_to_parse) != len(inventories):
+        tqdm.write(
+            f"resuming {prefix}: parsing {len(inventories_to_parse)} missing inventories"
+        )
     scene_specs = make_scene_specs(documents)
     cache_path = os.path.join(segments_dir, f"{cache_name}.pkl")
     scenes = load_or_create_segmentation_cache(
@@ -406,11 +521,13 @@ def run_group(
                 prefix,
                 (relinventory,),
                 "separate",
+                overwrite=force_outputs,
             )
 
     predictions = parse_predictions(
         adapter,
         scenes,
+        inventories=inventories_to_parse,
         on_inventory_complete=save_intermediate_outputs,
     )
     if output_mode in {"paired", "both"}:
@@ -424,6 +541,7 @@ def run_group(
             prefix,
             (),
             "paired",
+            overwrite=force_outputs,
         )
 
 
@@ -442,6 +560,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-model-version", default="unirst")
     parser.add_argument("--output-mode", choices=("separate", "paired", "both"), default="both")
     parser.add_argument("--force-segmentation", action="store_true")
+    parser.add_argument("--force-parsing", action="store_true")
     parser.add_argument("--skip-hc3", action="store_true")
     parser.add_argument("--skip-mage", action="store_true")
     return parser.parse_args()
@@ -475,6 +594,7 @@ def main() -> None:
                 f"hc3_{safe_name(source)}",
                 args.force_segmentation,
                 args.output_mode,
+                args.force_parsing,
             )
 
     if not args.skip_mage:
@@ -492,6 +612,7 @@ def main() -> None:
                 f"mage_{split}_gpu{args.gpu_id}",
                 args.force_segmentation,
                 args.output_mode,
+                args.force_parsing,
             )
 
 

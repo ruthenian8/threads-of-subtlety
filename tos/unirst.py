@@ -574,10 +574,24 @@ def tree_from_prediction(
 
 
 def write_jsonl_documents(documents: Iterable[Document], path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        for document in documents:
-            handle.write(f"{document.model_dump(mode='json')}\n")
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = None
+    try:
+        fd, temporary_path = tempfile.mkstemp(
+            dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for document in documents:
+                handle.write(f"{document.model_dump(mode='json')}\n")
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
 
 
 def build_scene_lookup(scenes: Sequence[Mapping[str, Any]]) -> Dict[str, Mapping[str, Any]]:

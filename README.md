@@ -65,6 +65,14 @@ The `rel-*` directories contain the normal `.discourse_parsed.jsonl`
 artifacts consumed by the graph and motif stages. The paired artifacts retain
 the shared EDU list together with each inventory's prediction and status.
 
+On subsequent runs, a group whose requested output paths already exist is
+skipped before segmentation and parsing. If only some separate inventories are
+missing, the preparation resumes with those inventories; a missing paired
+artifact requires all inventories to be parsed so it can contain the complete
+prediction set. Use `--force-parsing` to regenerate outputs, or
+`--force-segmentation` when the segmentation cache and all dependent outputs
+must be rebuilt.
+
 For a multi-GPU MAGE run, launch the preparation script once per GPU. Each
 worker receives a disjoint dataset chunk and writes a GPU-specific pickle and
 output shard:
