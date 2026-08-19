@@ -89,6 +89,11 @@ implementations on deterministic synthetic graphs, run:
 PYTHONPATH=. python benchmarks/benchmark_motifs.py --nodes 40 --repeats 3
 ```
 
+The benchmark covers M3 extraction, motif distributions, corpus-driven M6
+extraction, and exact parallel M9 composition. Use `--skip-m9` when the
+checked-in M3/M6 motif catalogs are unavailable; tune production parallelism
+with `--workers` and IPC batching with `--chunksize` on the M6 and M9 scripts.
+
 The preparation script supports `--output-mode separate`, `paired`, or
 `both`; `both` is the default. It also supports `--force-segmentation` when a
 segmentation cache must be regenerated.

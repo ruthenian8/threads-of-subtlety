@@ -1,5 +1,6 @@
 import json
 import os
+from concurrent.futures import ProcessPoolExecutor
 from itertools import combinations
 from typing import Dict
 
@@ -73,6 +74,146 @@ def deduplicate_graph_motifs(graphs):
         bucket.append(graph)
         unique.append(graph)
     return unique
+
+
+def index_graph_motifs(graphs):
+    """Index motifs by WL hash for constant-time candidate bucketing."""
+    buckets = {}
+    for graph in graphs:
+        motif_hash = nx.weisfeiler_lehman_graph_hash(graph, edge_attr="label_0")
+        buckets.setdefault(motif_hash, []).append(graph)
+    return buckets
+
+
+def observed_double_motifs(graph, motif_buckets):
+    """Return observed composites of two distinct M3 motif types.
+
+    This is equivalent to composing every pair of present M3 types at all
+    nine possible attachment points and testing induced-subgraph presence,
+    but it starts from actual three-node occurrences in ``graph``.
+    """
+    occurrences = []
+    for candidate in connected_three_node_subgraphs(graph):
+        motif_hash = nx.weisfeiler_lehman_graph_hash(
+            candidate, edge_attr="label_0"
+        )
+        bucket = motif_buckets.get(motif_hash, ())
+        if bucket and is_isomorphic_multiple(bucket, candidate):
+            occurrences.append((motif_hash, frozenset(candidate), candidate))
+
+    occurrences_by_node = {}
+    for occurrence in occurrences:
+        for node in occurrence[1]:
+            occurrences_by_node.setdefault(node, []).append(occurrence)
+
+    double_motifs = {}
+    for shared_occurrences in occurrences_by_node.values():
+        for (left_hash, left_nodes, left), (
+            right_hash,
+            right_nodes,
+            right,
+        ) in combinations(shared_occurrences, 2):
+            if left_hash == right_hash or len(left_nodes & right_nodes) != 1:
+                continue
+            nodes = left_nodes | right_nodes
+            composite = nx.compose(left, right)
+            # GraphMatcher.subgraph_isomorphisms_iter() uses induced subgraphs.
+            # Reject occurrence pairs with additional cross-edges accordingly.
+            if graph.subgraph(nodes).number_of_edges() != composite.number_of_edges():
+                continue
+            motif_hash = nx.weisfeiler_lehman_graph_hash(
+                composite, edge_attr="label_0"
+            )
+            double_motifs[motif_hash] = composite
+    return double_motifs
+
+
+def prepare_double_docking_motifs(graphs):
+    """Return triangular M6 motifs with an immutable docking-point label."""
+    prepared = []
+    for graph in graphs:
+        integer_graph = nx.convert_node_labels_to_integers(graph)
+        if integer_graph.number_of_edges() != 6:
+            continue
+        for node in integer_graph:
+            if (
+                integer_graph.in_degree(node) == 2
+                and integer_graph.out_degree(node) == 0
+            ):
+                prepared.append(
+                    nx.relabel_nodes(
+                        integer_graph, {node: "docking_point"}, copy=True
+                    )
+                )
+                break
+    return prepared
+
+
+def prepare_single_docking_variants(graphs):
+    """Return every valid immutable docking variant of triangular M3 motifs."""
+    variants = []
+    for graph in graphs:
+        if graph.number_of_edges() != 3:
+            continue
+        integer_graph = nx.convert_node_labels_to_integers(graph)
+        named_graph = nx.relabel_nodes(
+            integer_graph, {0: "a", 1: "b", 2: "c"}, copy=True
+        )
+        for node in named_graph:
+            in_degree = named_graph.in_degree(node)
+            out_degree = named_graph.out_degree(node)
+            if (in_degree == 1 and out_degree == 1) or (
+                in_degree == 0 and out_degree == 2
+            ):
+                variants.append(
+                    nx.relabel_nodes(
+                        named_graph, {node: "docking_point"}, copy=True
+                    )
+                )
+    return variants
+
+
+def compose_triple_motifs(double_motif, single_variants):
+    """Compose one M6 motif with all M3 docking variants, keyed by WL hash."""
+    candidates = {}
+    for single_motif in single_variants:
+        triple_motif = nx.compose(double_motif, single_motif)
+        motif_hash = nx.weisfeiler_lehman_graph_hash(
+            triple_motif, edge_attr="label_0"
+        )
+        candidates[motif_hash] = triple_motif
+    return candidates
+
+
+_single_docking_variants = ()
+
+
+def _init_triple_motif_worker(single_variants):
+    global _single_docking_variants
+    _single_docking_variants = single_variants
+
+
+def _compose_triple_motif_worker(double_motif):
+    return compose_triple_motifs(double_motif, _single_docking_variants)
+
+
+def iter_composed_triple_motifs(
+    double_motifs, single_variants, workers=1, chunksize=8
+):
+    """Yield exact M9 candidates while keeping M3 data resident per worker."""
+    if workers == 1:
+        for double_motif in double_motifs:
+            yield compose_triple_motifs(double_motif, single_variants)
+        return
+
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_triple_motif_worker,
+        initargs=(single_variants,),
+    ) as executor:
+        yield from executor.map(
+            _compose_triple_motif_worker, double_motifs, chunksize=chunksize
+        )
 
 
 def save_graph_motifs(

@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import os
 
-import networkx as nx
+from tqdm.auto import tqdm
 
 from tos.tos_utils import (
+    iter_composed_triple_motifs,
     load_graph_motifs,
+    prepare_double_docking_motifs,
+    prepare_single_docking_variants,
     save_graph_motifs,
     write_selected_motif_hashes,
 )
@@ -19,7 +22,13 @@ def main() -> None:
     parser.add_argument("--motif-dir", default="data/motifs")
     parser.add_argument("--dataset-name", default="hc3-mage")
     parser.add_argument("--show-tracking", action="store_true")
+    parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
+    parser.add_argument("--chunksize", type=int, default=8)
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.chunksize < 1:
+        parser.error("--chunksize must be at least 1")
 
     single_motifs_path = os.path.join(
         args.motif_dir, f"{args.dataset_name}_M3_motifs.json"
@@ -29,67 +38,31 @@ def main() -> None:
     )
     single_motifs = load_graph_motifs(single_motifs_path)
     double_motifs = load_graph_motifs(double_motifs_path)
-    single_motifs = {
-        h: nx.convert_node_labels_to_integers(m) for h, m in single_motifs.items()
-    }
-    double_motifs = {
-        h: nx.convert_node_labels_to_integers(m) for h, m in double_motifs.items()
-    }
     print(f"no. of single motifs: {len(single_motifs)}")
     print(f"no. of double motifs: {len(double_motifs)}")
 
-    single_triangular_motifs = {
-        k: v for k, v in single_motifs.items() if v.number_of_edges() == 3
-    }
-    double_triangular_motifs = {
-        k: v for k, v in double_motifs.items() if v.number_of_edges() == 6
-    }
-
-    filter_double_motif_hashes = set()
-    for double_m_h, double_m_g in double_triangular_motifs.items():
-        docking_point_found = False
-        for double_m_node in double_m_g.nodes():
-            if (
-                double_m_g.in_degree(double_m_node) == 2
-                and double_m_g.out_degree(double_m_node) == 0
-            ):
-                nx.relabel_nodes(double_m_g, {double_m_node: "docking_point"}, copy=False)
-                docking_point_found = True
-                break
-        if not docking_point_found:
-            filter_double_motif_hashes.add(double_m_h)
-    for filter_hash in filter_double_motif_hashes:
-        del double_triangular_motifs[filter_hash]
-
-    single_motifs_prepared = {}
-    for single_m_h, single_m_g in single_triangular_motifs.items():
-        nx.relabel_nodes(single_m_g, {0: "a", 1: "b", 2: "c"}, copy=False)
-        candidates = []
-        for single_m_node in single_m_g.nodes():
-            if (
-                single_m_g.in_degree(single_m_node) == 1
-                and single_m_g.out_degree(single_m_node) == 1
-            ) or (
-                single_m_g.in_degree(single_m_node) == 0
-                and single_m_g.out_degree(single_m_node) == 2
-            ):
-                candidates.append(
-                    nx.relabel_nodes(
-                        single_m_g, {single_m_node: "docking_point"}, copy=True
-                    )
-                )
-        if candidates:
-            single_motifs_prepared[single_m_h] = candidates
+    double_motifs_prepared = prepare_double_docking_motifs(
+        double_motifs.values()
+    )
+    single_motifs_prepared = prepare_single_docking_variants(
+        single_motifs.values()
+    )
+    print(f"no. of prepared double motifs: {len(double_motifs_prepared)}")
+    print(f"no. of single docking variants: {len(single_motifs_prepared)}")
 
     triple_motifs_candidates = {}
-    for double_m_g in double_triangular_motifs.values():
-        for single_m_gs in single_motifs_prepared.values():
-            for single_m_g in single_m_gs:
-                triple_motif = nx.compose(double_m_g, single_m_g)
-                triple_hash = nx.weisfeiler_lehman_graph_hash(
-                    triple_motif, edge_attr="label_0"
-                )
-                triple_motifs_candidates[triple_hash] = triple_motif
+    results = iter_composed_triple_motifs(
+        double_motifs_prepared,
+        single_motifs_prepared,
+        args.workers,
+        args.chunksize,
+    )
+    for result in tqdm(
+        results,
+        total=len(double_motifs_prepared),
+        desc="composing triple motifs",
+    ):
+        triple_motifs_candidates.update(result)
     print(
         "len of triple triangular motifs candidates: "
         f"{len(triple_motifs_candidates)}"
