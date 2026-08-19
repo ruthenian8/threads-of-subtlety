@@ -48,15 +48,14 @@ If the motif definitions are being regenerated, each RST inventory is processed
 independently. This creates separate motif files and manifests per standard:
 
 ```bash
-for relinventory in eng.erst.gum eng.rst.rstdt deu.rst.pcc nld.rst.nldt; do
-  motif_dir="data/motifs/${relinventory}"
-  python 2_extract_single_triads.py \
-    --root data/unirst --relinventory "$relinventory" --motif-dir "$motif_dir"
-  python 3_extract_double_triads.py \
-    --root data/unirst --relinventory "$relinventory" --motif-dir "$motif_dir"
-  python 4_extract_triple_triads.py --motif-dir "$motif_dir"
-done
+python 2_extract_single_triads.py --root data/unirst
+python 3_extract_double_triads.py --root data/unirst
+python 4_extract_triple_triads.py --root data/unirst
 ```
+
+All three commands discover the `rel-*` directories and process every relation
+inventory by default. Pass `--relinventory` to any command to process only one;
+with that option, `--motif-dir` names the exact inventory directory.
 
 Each final triad command writes a matching
 `hc3-mage_selected-motif-hashes.generated.json`. The distribution stage can
