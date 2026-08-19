@@ -70,16 +70,17 @@ data/motifs/
 ```
 
 ```bash
-for relinventory in eng.erst.gum eng.rst.rstdt deu.rst.pcc nld.rst.nldt; do
-  python 5_add_motif_dists_to_unirst_datasets.py \
-    --root data/unirst --relinventory "$relinventory" \
-    --motif-dir "data/motifs/${relinventory}"
-done
+python 5_add_motif_dists_to_unirst_datasets.py --root data/unirst
 ```
 
 The generated manifest selects hashes from that standard's motif files.
 Pass `--selected-hashes` to use a curated manifest instead; stale manifests
 are rejected with an actionable error.
+
+Motif distributions are written incrementally to `*.partial` files and moved
+atomically to their final paths when complete. Existing final outputs are
+skipped; pass `--force` to rebuild them. Use `--workers` and `--chunksize`
+(documents per worker task) to tune CPU parallelism and IPC batching.
 
 To compare the optimized exact motif operations with their original reference
 implementations on deterministic synthetic graphs, run:

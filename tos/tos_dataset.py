@@ -3,9 +3,9 @@ import os
 import pickle
 import random
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import networkx as nx
 import numpy as np
@@ -55,6 +55,28 @@ class Document(BaseModel):
     scene_discourse_trees: Optional[Dict[int, Optional[SceneDiscourseTree]]]
     source: Optional[str]
     label: Optional[int]
+
+
+@dataclass
+class MotifMetadata:
+    graph: nx.DiGraph
+    node_count: int
+    edge_count: int
+    edge_label_counts: Dict[str, int]
+    in_degrees: Tuple[int, ...]
+    out_degrees: Tuple[int, ...]
+
+
+@dataclass
+class MotifGraphContext:
+    graph: nx.DiGraph
+    diameter: int
+    root_distances: Dict[Any, int]
+    node_count: int
+    edge_count: int
+    edge_label_counts: Dict[str, int]
+    in_degrees: Tuple[int, ...]
+    out_degrees: Tuple[int, ...]
 
 
 class ToSDataset:
@@ -468,32 +490,149 @@ class ToSDataset:
 
     @staticmethod
     def calculate_motif_distribution(
-        G: nx.DiGraph, graph_motifs: List[nx.DiGraph], root_label: str
+        G: nx.DiGraph,
+        graph_motifs: List[Union[nx.DiGraph, MotifMetadata]],
+        root_label: str,
+        graph_context: MotifGraphContext = None,
     ) -> Dict[str, np.ndarray]:
-        undirected = G.to_undirected()
-        G_diameter = nx.diameter(undirected)
-        root_distances = nx.single_source_shortest_path_length(
-            undirected, root_label
+        metadata = ToSDataset.prepare_motif_metadata(graph_motifs)
+        context = graph_context or ToSDataset.prepare_motif_graph_context(
+            G, root_label
         )
+        return ToSDataset._calculate_motif_distribution(context, metadata)
+
+    @staticmethod
+    def prepare_motif_metadata(
+        graph_motifs: Iterable[Union[nx.DiGraph, MotifMetadata]]
+    ) -> List[MotifMetadata]:
+        if not isinstance(graph_motifs, list):
+            graph_motifs = list(graph_motifs)
+        if not graph_motifs or isinstance(graph_motifs[0], MotifMetadata):
+            return graph_motifs
+
+        metadata = []
+        for motif in graph_motifs:
+            metadata.append(
+                MotifMetadata(
+                    graph=motif,
+                    node_count=motif.number_of_nodes(),
+                    edge_count=motif.number_of_edges(),
+                    edge_label_counts=dict(
+                        Counter(
+                            edge_data["label_0"]
+                            for _, _, edge_data in motif.edges(data=True)
+                        )
+                    ),
+                    in_degrees=tuple(
+                        sorted(
+                            (degree for _, degree in motif.in_degree()),
+                            reverse=True,
+                        )
+                    ),
+                    out_degrees=tuple(
+                        sorted(
+                            (degree for _, degree in motif.out_degree()),
+                            reverse=True,
+                        )
+                    ),
+                )
+            )
+        return metadata
+
+    @staticmethod
+    def prepare_motif_graph_context(
+        G: nx.DiGraph, root_label: str
+    ) -> MotifGraphContext:
+        undirected = G.to_undirected()
+        return MotifGraphContext(
+            graph=G,
+            diameter=nx.diameter(undirected),
+            root_distances=dict(
+                nx.single_source_shortest_path_length(undirected, root_label)
+            ),
+            node_count=G.number_of_nodes(),
+            edge_count=G.number_of_edges(),
+            edge_label_counts=dict(
+                Counter(
+                    edge_data["label_0"]
+                    for _, _, edge_data in G.edges(data=True)
+                )
+            ),
+            in_degrees=tuple(
+                sorted((degree for _, degree in G.in_degree()), reverse=True)
+            ),
+            out_degrees=tuple(
+                sorted((degree for _, degree in G.out_degree()), reverse=True)
+            ),
+        )
+
+    @staticmethod
+    def calculate_motif_distributions(
+        G: nx.DiGraph,
+        motif_groups: Dict[str, List[Union[nx.DiGraph, MotifMetadata]]],
+        root_label: str,
+    ) -> Dict[str, Dict[str, np.ndarray]]:
+        """Calculate several motif groups with one shared graph traversal."""
+        context = ToSDataset.prepare_motif_graph_context(G, root_label)
+        return {
+            name: ToSDataset._calculate_motif_distribution(
+                context, ToSDataset.prepare_motif_metadata(motifs)
+            )
+            for name, motifs in motif_groups.items()
+        }
+
+    @staticmethod
+    def _degree_bounds_fit(
+        required: Tuple[int, ...], available: Tuple[int, ...]
+    ) -> bool:
+        return len(required) <= len(available) and all(
+            required_degree <= available_degree
+            for required_degree, available_degree in zip(required, available)
+        )
+
+    @staticmethod
+    def _motif_can_match(
+        context: MotifGraphContext, motif: MotifMetadata
+    ) -> bool:
+        if (
+            motif.node_count > context.node_count
+            or motif.edge_count > context.edge_count
+        ):
+            return False
+        if any(
+            count > context.edge_label_counts.get(label, 0)
+            for label, count in motif.edge_label_counts.items()
+        ):
+            return False
+        return ToSDataset._degree_bounds_fit(
+            motif.in_degrees, context.in_degrees
+        ) and ToSDataset._degree_bounds_fit(
+            motif.out_degrees, context.out_degrees
+        )
+
+    @staticmethod
+    def _calculate_motif_distribution(
+        context: MotifGraphContext, graph_motifs: List[MotifMetadata]
+    ) -> Dict[str, np.ndarray]:
         hist = np.zeros(len(graph_motifs), dtype=float)
         wad = np.zeros(len(graph_motifs), dtype=float)
 
-        for index, motif in enumerate(graph_motifs):
-            if motif.number_of_nodes() == 1:
-                hist[index] = G.number_of_nodes()
+        for index, metadata in enumerate(graph_motifs):
+            motif = metadata.graph
+            if metadata.node_count == 1:
+                hist[index] = context.node_count
                 continue
-            if motif.number_of_nodes() == 2:
-                hist[index] = G.number_of_edges()
+            if metadata.node_count == 2:
+                hist[index] = context.edge_count
                 continue
-            if (
-                motif.number_of_nodes() > G.number_of_nodes()
-                or motif.number_of_edges() > G.number_of_edges()
-            ):
+            if not ToSDataset._motif_can_match(context, metadata):
                 wad[index] = -1
                 continue
 
             DiGM = nx.algorithms.isomorphism.DiGraphMatcher(
-                G, motif, edge_match=lambda e1, e2: e1["label_0"] == e2["label_0"]
+                context.graph,
+                motif,
+                edge_match=lambda e1, e2: e1["label_0"] == e2["label_0"],
             )
 
             total_depth = 0.0
@@ -502,7 +641,10 @@ class ToSDataset:
                 # subgraph e.g.: {'span_1-31': 'span_21-24', 'span_29-31': 'span_23-24', 'span_31-31': 'span_24-24'}, <dict>
                 motif_nodes = subgraph.keys()
                 motif_depth = np.mean(
-                    [root_distances[node_label] for node_label in motif_nodes]
+                    [
+                        context.root_distances[node_label]
+                        for node_label in motif_nodes
+                    ]
                 )
                 total_depth += motif_depth
                 hist[index] += 1
@@ -512,7 +654,7 @@ class ToSDataset:
 
         num_of_motifs = np.sum(hist)
         motif_freqs = hist / num_of_motifs if num_of_motifs > 0 else hist
-        wad = wad / G_diameter
+        wad = wad / context.diameter
         # -1 means that the motif does not exist in the graph
         wad[wad < 0] = -1
         return {"raw": hist.tolist(), "mf": motif_freqs.tolist(), "wad": wad.tolist()}
@@ -529,21 +671,34 @@ class ToSDataset:
                 continue
             graph = tree.graph_networkx
             root_label = f"span_1-{len(tree.edus)}"
-            m3_dists = ToSDataset.calculate_motif_distribution(
-                graph, m3_motifs, root_label=root_label
-            )
-            m6_dists = ToSDataset.calculate_motif_distribution(
-                graph, m6_motifs, root_label=root_label
-            )
-            m9_dists = ToSDataset.calculate_motif_distribution(
-                graph, m9_motifs, root_label=root_label
+            motif_dists = ToSDataset.calculate_motif_distributions(
+                graph,
+                {"m3": m3_motifs, "m6": m6_motifs, "m9": m9_motifs},
+                root_label,
             )
             tree.motif_dists = {
-                "m3": DiscourseMotifDists(**m3_dists),
-                "m6": DiscourseMotifDists(**m6_dists),
-                "m9": DiscourseMotifDists(**m9_dists),
+                name: DiscourseMotifDists(**distribution)
+                for name, distribution in motif_dists.items()
             }
         return document
+
+    @staticmethod
+    def iter_document_corpus(file_path: str) -> Iterator[Document]:
+        """Yield documents and reconstruct their NetworkX discourse graphs."""
+        with open(file_path) as f:
+            for line in f:
+                serialized = line.strip()
+                if not serialized:
+                    continue
+                sample = eval(serialized)
+                document = Document(**sample)
+                for tree in document.scene_discourse_trees.values():
+                    if tree is None:
+                        continue
+                    tree.graph_networkx = nx.json_graph.node_link_graph(
+                        tree.graph_dict
+                    )
+                yield document
 
     @staticmethod
     def load_document_corpus(file_path: str) -> List[Document]:
@@ -555,18 +710,7 @@ class ToSDataset:
         Returns:
             List[Document]: A list of Document objects.
         """
-        dataset = []
-        with open(file_path) as f:
-            for line in f:
-                sample = eval(line.strip())
-                document = Document(**sample)
-                for tree_idx, tree in document.scene_discourse_trees.items():
-                    if tree is None:
-                        continue
-                    G = nx.json_graph.node_link_graph(tree.graph_dict)
-                    tree.graph_networkx = G
-                dataset.append(document)
-        return dataset
+        return list(ToSDataset.iter_document_corpus(file_path))
 
     @staticmethod
     def load_datasets(file_paths: str, max_per_file: int = None) -> List[Document]:
@@ -611,7 +755,14 @@ class ToSDataset:
                     if tree is None:
                         continue
                     tree.graph_networkx = None
-                f.write(f"{document.model_dump(mode='json')}\n")
+                f.write(f"{ToSDataset.document_to_dict(document)}\n")
+
+    @staticmethod
+    def document_to_dict(document: Document) -> Dict[str, Any]:
+        """Return a JSON-compatible dict with Pydantic v1/v2 support."""
+        if hasattr(document, "model_dump"):
+            return document.model_dump(mode="json")
+        return document.dict()
 
 
 @dataclass
