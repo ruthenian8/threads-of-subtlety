@@ -163,6 +163,10 @@ cython_debug/
 old_version/
 data/hc3/
 data/mage/
+# Reproducible UniRST parses, graphs, split corpora, and inventory catalogs.
+data/unirst/
+data/motifs/*/
+history.py
 longformer_dataset*.pkl
 results/
 test_*.py

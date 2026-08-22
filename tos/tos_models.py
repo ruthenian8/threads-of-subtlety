@@ -29,10 +29,15 @@ class LongformerWithMotifsClassificationHead(torch.nn.Module):
 
 
 class LongformerWithMotifsForSequenceClassification(torch.nn.Module):
-    def __init__(self, base_model_path="allenai/longformer-base-4096", num_labels=2):
+    def __init__(
+        self,
+        base_model_path="allenai/longformer-base-4096",
+        num_labels=2,
+        motif_dims=None,
+    ):
         super().__init__()
         # self.motif_dims = 31 + 96 + 80
-        self.motif_dims = (31 + 96 + 80) * 2
+        self.motif_dims = (31 + 96 + 80) * 2 if motif_dims is None else int(motif_dims)
         self.num_labels = num_labels
 
         self.longformer = LongformerModel.from_pretrained(

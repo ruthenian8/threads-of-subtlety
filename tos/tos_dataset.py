@@ -2,6 +2,7 @@ import json
 import os
 import pickle
 import random
+from glob import glob
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -96,6 +97,8 @@ class ToSDataset:
         batch_size: int = 64,
         gpu_id: int = None,
         motif_dir: str = None,
+        dataset_name: str = "hc3-mage",
+        motif_sizes: Tuple[int, ...] = (3, 6, 9),
     ):
         assert os.path.isdir(dmrst_parser_dir)
         sys.path.append(dmrst_parser_dir)
@@ -104,24 +107,33 @@ class ToSDataset:
         self.batch_size = batch_size
         self.gpu_id = gpu_id
         self.motif_dir = motif_dir
+        self.dataset_name = dataset_name
+        self.motif_sizes = tuple(motif_sizes)
+        for size in (3, 6, 9):
+            setattr(self, f"m{size}_motifs", None)
         if self.motif_dir:
-            selected_manifest = resolve_selected_motif_hashes(self.motif_dir)
+            selected_manifest = resolve_selected_motif_hashes(
+                self.motif_dir, dataset_name=self.dataset_name
+            )
             self.selected_hashes = load_json(selected_manifest)
             validate_selected_motif_hashes(
-                self.motif_dir, self.selected_hashes
+                self.motif_dir,
+                self.selected_hashes,
+                dataset_name=self.dataset_name,
+                sizes=self.motif_sizes,
             )
-            self.m3_motifs = ToSDataset.load_motifs(
-                os.path.join(self.motif_dir, "hc3-mage_M3_motifs.json"),
-                self.selected_hashes["m3"],
-            )
-            self.m6_motifs = ToSDataset.load_motifs(
-                os.path.join(self.motif_dir, "hc3-mage_M6_motifs.json"),
-                self.selected_hashes["m6"],
-            )
-            self.m9_motifs = ToSDataset.load_motifs(
-                os.path.join(self.motif_dir, "hc3-mage_M9_motifs.json"),
-                self.selected_hashes["m9"],
-            )
+            for size in self.motif_sizes:
+                setattr(
+                    self,
+                    f"m{size}_motifs",
+                    ToSDataset.load_motifs(
+                        os.path.join(
+                            self.motif_dir,
+                            f"{self.dataset_name}_M{size}_motifs.json",
+                        ),
+                        self.selected_hashes[f"m{size}"],
+                    ),
+                )
 
         parser_model_path = os.path.join(
             dmrst_parser_dir, "depth_mode/Savings/multi_all_checkpoint.torchsave"
@@ -229,7 +241,11 @@ class ToSDataset:
             _document = ToSDataset.add_discourse_graphs_to_document(_document)
         if add_motif_dists:
             _document = ToSDataset.add_motif_distributions_to_document(
-                _document, self.m3_motifs, self.m6_motifs, self.m9_motifs
+                _document,
+                **{
+                    f"m{size}_motifs": getattr(self, f"m{size}_motifs")
+                    for size in self.motif_sizes
+                },
             )
         return _document
 
@@ -824,10 +840,17 @@ class ToSDataset:
                 continue
             graph = tree.graph_networkx
             root_label = f"span_1-{len(tree.edus)}"
+            motif_groups = {
+                name: motifs
+                for name, motifs in {
+                    "m3": m3_motifs,
+                    "m6": m6_motifs,
+                    "m9": m9_motifs,
+                }.items()
+                if motifs is not None
+            }
             motif_dists = ToSDataset.calculate_motif_distributions(
-                graph,
-                {"m3": m3_motifs, "m6": m6_motifs, "m9": m9_motifs},
-                root_label,
+                graph, motif_groups, root_label
             )
             tree.motif_dists = {
                 name: DiscourseMotifDists(**distribution)
@@ -951,10 +974,39 @@ class LongformerDataCollator:
 
 
 class LongformerDataset(Dataset):
-    def __init__(self, split: str, shuffle: bool, saved_dir: str):
+    def __init__(
+        self,
+        split: str,
+        shuffle: bool,
+        saved_dir: str,
+        data_dir: str = "data",
+        relinventory: str = None,
+        motif_sizes: Tuple[int, ...] = None,
+    ):
+        self.data_dir = data_dir
+        if relinventory is None:
+            inventory_root = os.path.join(data_dir, "unirst")
+            inventory_dirs = sorted(glob(os.path.join(inventory_root, "rel-*")))
+            if len(inventory_dirs) == 1:
+                relinventory = os.path.basename(inventory_dirs[0])[4:]
+            elif len(inventory_dirs) > 1:
+                raise ValueError(
+                    "Multiple UniRST relation inventories are available; "
+                    "pass relinventory explicitly so motif dimensions are not mixed."
+                )
+        self.relinventory = relinventory
+        self.motif_sizes = tuple(motif_sizes or ((3, 6) if relinventory else (3, 6, 9)))
         if not os.path.isdir(saved_dir):
             os.makedirs(saved_dir)
-        dataset_path = os.path.join(saved_dir, f"longformer_dataset.{split}.pkl")
+        cache_suffix = "-".join(f"m{size}" for size in self.motif_sizes)
+        inventory_suffix = (
+            f".{re.sub(r'[^A-Za-z0-9_.-]+', '_', relinventory)}"
+            if relinventory
+            else ""
+        )
+        dataset_path = os.path.join(
+            saved_dir, f"longformer_dataset{inventory_suffix}.{split}.{cache_suffix}.pkl"
+        )
         if os.path.exists(dataset_path):
             with open(dataset_path, "rb") as f:
                 self.dataset = pickle.load(f)
@@ -962,47 +1014,80 @@ class LongformerDataset(Dataset):
         else:
             self.create_dataset(split, dataset_path)
 
+        self.motif_dims = (
+            int(self.dataset[0]["motif_dists"].shape[0]) if self.dataset else 0
+        )
         if shuffle:
             random.shuffle(self.dataset)
 
     def create_dataset(self, split: str, save_path: str):
-        if split == "train":
+        if self.relinventory:
+            inventory = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.relinventory)
+            inventory_dir = os.path.join(self.data_dir, "unirst", f"rel-{inventory}")
+            if split in {"mage_ood_test", "mage_ood_para_test"}:
+                name = "gpt_para" if split == "mage_ood_para_test" else "gpt"
+                dataset_paths = [
+                    os.path.join(
+                        inventory_dir,
+                        f"test_ood_set_{name}.discourse_parsed.graph_added.m3_m6_motif_dists.jsonl",
+                    )
+                ]
+            else:
+                split_name = {
+                    "valid": "validation",
+                    "validation": "validation",
+                    "hc3_test": "test",
+                    "mage_test": "test",
+                }.get(split, split)
+                dataset_paths = [
+                    os.path.join(
+                        inventory_dir,
+                        f"hc3_{split_name}.discourse_parsed.graph_added.m3_m6_motif_dists.jsonl",
+                    )
+                ]
+        elif split == "train":
             dataset_paths = [
-                "data/hc3/hc3_train.discourse_parsed.graph_added.motif_dists.jsonl",
-                "data/mage/mage_train_human.discourse_parsed.graph_added.motif_dists.jsonl",
-                "data/mage/mage_train_machine.discourse_parsed.graph_added.motif_dists.jsonl",
+                os.path.join(self.data_dir, "hc3/hc3_train.discourse_parsed.graph_added.motif_dists.jsonl"),
+                os.path.join(self.data_dir, "mage/mage_train_human.discourse_parsed.graph_added.motif_dists.jsonl"),
+                os.path.join(self.data_dir, "mage/mage_train_machine.discourse_parsed.graph_added.motif_dists.jsonl"),
             ]
         elif split == "valid":
             dataset_paths = [
-                "data/hc3/hc3_validation.discourse_parsed.graph_added.motif_dists.jsonl",
-                "data/mage/mage_validation_human.discourse_parsed.graph_added.motif_dists.jsonl",
-                "data/mage/mage_validation_machine.discourse_parsed.graph_added.motif_dists.jsonl",
+                os.path.join(self.data_dir, "hc3/hc3_validation.discourse_parsed.graph_added.motif_dists.jsonl"),
+                os.path.join(self.data_dir, "mage/mage_validation_human.discourse_parsed.graph_added.motif_dists.jsonl"),
+                os.path.join(self.data_dir, "mage/mage_validation_machine.discourse_parsed.graph_added.motif_dists.jsonl"),
             ]
         elif split == "test":
             dataset_paths = [
-                "data/hc3/hc3_test.discourse_parsed.graph_added.motif_dists.jsonl",
-                "data/mage/mage_test_human.discourse_parsed.graph_added.motif_dists.jsonl",
-                "data/mage/mage_test_machine.discourse_parsed.graph_added.motif_dists.jsonl",
+                os.path.join(self.data_dir, "hc3/hc3_test.discourse_parsed.graph_added.motif_dists.jsonl"),
+                os.path.join(self.data_dir, "mage/mage_test_human.discourse_parsed.graph_added.motif_dists.jsonl"),
+                os.path.join(self.data_dir, "mage/mage_test_machine.discourse_parsed.graph_added.motif_dists.jsonl"),
             ]
         elif split == "hc3_test":
             dataset_paths = [
-                "data/hc3/hc3_test.discourse_parsed.graph_added.motif_dists.jsonl",
+                os.path.join(self.data_dir, "hc3/hc3_test.discourse_parsed.graph_added.motif_dists.jsonl"),
             ]
         elif split == "mage_test":
             dataset_paths = [
-                "data/mage/mage_test_human.discourse_parsed.graph_added.motif_dists.jsonl",
-                "data/mage/mage_test_machine.discourse_parsed.graph_added.motif_dists.jsonl",
+                os.path.join(self.data_dir, "mage/mage_test_human.discourse_parsed.graph_added.motif_dists.jsonl"),
+                os.path.join(self.data_dir, "mage/mage_test_machine.discourse_parsed.graph_added.motif_dists.jsonl"),
             ]
         elif split == "mage_ood_test":
             dataset_paths = [
-                "data/mage/test_ood_set_gpt.discourse_parsed.graph_added.motif_dists.jsonl",
+                os.path.join(self.data_dir, "mage/test_ood_set_gpt.discourse_parsed.graph_added.motif_dists.jsonl"),
             ]
         elif split == "mage_ood_para_test":
             dataset_paths = [
-                "data/mage/test_ood_set_gpt_para.discourse_parsed.graph_added.motif_dists.jsonl",
+                os.path.join(self.data_dir, "mage/test_ood_set_gpt_para.discourse_parsed.graph_added.motif_dists.jsonl"),
             ]
         else:
             raise ValueError(f"Invalid split: {split}")
+
+        missing = [path for path in dataset_paths if not os.path.exists(path)]
+        if missing:
+            raise FileNotFoundError(
+                "Dataset split files are missing: " + ", ".join(missing)
+            )
 
         self.dataset = self.prepare_at_scene_level(
             ToSDataset.load_datasets(dataset_paths)
@@ -1020,31 +1105,32 @@ class LongformerDataset(Dataset):
             for scene in document.scene_discourse_trees.values():
                 if scene is None:
                     continue
-                m3_mf = np.asarray(scene.motif_dists["m3"].mf)
-                m3_wad = np.asarray(scene.motif_dists["m3"].wad)
-                m6_mf = np.asarray(scene.motif_dists["m6"].mf)
-                m6_wad = np.asarray(scene.motif_dists["m6"].wad)
-                m9_mf = np.asarray(scene.motif_dists["m9"].mf)
-                m9_wad = np.asarray(scene.motif_dists["m9"].wad)
-                assert m3_mf.shape == m3_wad.shape
-                assert m6_mf.shape == m6_wad.shape
-                assert m9_mf.shape == m9_wad.shape
-                m3_feats = np.zeros(m3_mf.shape[0] * 2, dtype=np.float32)
-                m3_feats[::2] += m3_mf
-                m3_feats[1::2] += m3_wad
-                m6_feats = np.zeros(m6_mf.shape[0] * 2, dtype=np.float32)
-                m6_feats[::2] += m6_mf
-                m6_feats[1::2] += m6_wad
-                m9_feats = np.zeros(m9_mf.shape[0] * 2, dtype=np.float32)
-                m9_feats[::2] += m9_mf
-                m9_feats[1::2] += m9_wad
-                motif_dists = np.concatenate([m3_feats, m6_feats, m9_feats], axis=0)
+                feature_groups = []
+                for size in self.motif_sizes:
+                    try:
+                        distribution = scene.motif_dists[f"m{size}"]
+                    except (KeyError, TypeError):
+                        raise ValueError(
+                            f"Scene is missing m{size} motif distributions; "
+                            f"requested motif sizes are {self.motif_sizes}"
+                        ) from None
+                    mf = np.asarray(distribution.mf)
+                    wad = np.asarray(distribution.wad)
+                    assert mf.shape == wad.shape
+                    features = np.zeros(mf.shape[0] * 2, dtype=np.float32)
+                    features[::2] = mf
+                    features[1::2] = wad
+                    feature_groups.append(features)
+                motif_dists = np.concatenate(feature_groups, axis=0)
                 sample = {
                     "text": scene.text,
                     "label": label,
                     "motif_dists": motif_dists,
                 }
                 dataset.append(sample)
+        self.motif_dims = (
+            int(dataset[0]["motif_dists"].shape[0]) if dataset else 0
+        )
         return dataset
 
     def __len__(self) -> int:
