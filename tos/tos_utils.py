@@ -256,20 +256,35 @@ def write_selected_motif_hashes(
     dataset_name: str = "hc3-mage",
     sizes=(3, 6, 9),
     output_path: str = None,
+    selected_hashes_by_size: Dict[str, list] = None,
 ) -> str:
     """Write a selection manifest matching the currently saved motif files.
 
     Regenerated motifs have different Weisfeiler-Lehman hashes from the
     checked-in corpus, so the old curated manifest cannot safely be reused.
-    The generated manifest deliberately selects every motif; users can curate
-    it afterward without changing the motif files.
+    The generated manifest selects every motif by default. Callers may supply
+    a subset for individual groups through ``selected_hashes_by_size``.
     """
     manifest = {}
     for size in sizes:
         motif_path = os.path.join(motif_dir, f"{dataset_name}_M{size}_motifs.json")
         with open(motif_path, encoding="utf-8") as handle:
             motifs = json.load(handle)
-        manifest[f"m{size}"] = sorted(motifs)
+        group_name = f"m{size}"
+        selected = (
+            selected_hashes_by_size.get(group_name)
+            if selected_hashes_by_size is not None
+            else None
+        )
+        if selected is None:
+            manifest[group_name] = sorted(motifs)
+            continue
+        missing = sorted(set(selected) - set(motifs))
+        if missing:
+            raise ValueError(
+                f"Cannot select {len(missing)} unavailable {group_name} hashes"
+            )
+        manifest[group_name] = sorted(set(selected))
 
     output_path = output_path or os.path.join(
         motif_dir, f"{dataset_name}_selected-motif-hashes.generated.json"
@@ -322,15 +337,42 @@ def validate_selected_motif_hashes(
         raise ValueError(
             "Selected motif hashes do not match the motif files ("
             f"{details}). Regenerate the selection manifest with "
-            "4_extract_triple_triads.py or pass --selected-hashes with a "
-            "matching manifest."
+            "3_extract_double_triads.py for M3+M6 (or "
+            "4_extract_triple_triads.py when M9 is required), or pass "
+            "--selected-hashes with a matching manifest."
         )
+
+
+def node_link_graph_compat(data: Dict) -> nx.Graph:
+    """Load NetworkX node-link JSON using either edge-list key.
+
+    NetworkX changed the default serialized edge-list name from ``links`` to
+    ``edges``.  Catalogs can outlive the environment that generated them, so
+    select the key present in the artifact and support both API spellings.
+    """
+    edge_key = "edges" if "edges" in data else "links"
+    try:
+        return nx.json_graph.node_link_graph(data, link=edge_key)
+    except TypeError:
+        try:
+            return nx.json_graph.node_link_graph(data, edges=edge_key)
+        except TypeError:
+            return nx.json_graph.node_link_graph(
+                data,
+                attrs={
+                    "source": "source",
+                    "target": "target",
+                    "name": "id",
+                    "key": "key",
+                    "link": edge_key,
+                },
+            )
 
 
 def load_graph_motifs(path: str) -> Dict[str, nx.Graph]:
     with open(path, "r") as f:
         motifs = json.load(f)
-    return {k: nx.json_graph.node_link_graph(v) for k, v in motifs.items()}
+    return {k: node_link_graph_compat(v) for k, v in motifs.items()}
 
 
 def compute_metrics(eval_pred):

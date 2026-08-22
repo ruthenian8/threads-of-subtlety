@@ -44,38 +44,71 @@ Then add discourse graphs:
 python 1_add_graphs_to_unirst_datasets.py --root data/unirst
 ```
 
-If the motif definitions are being regenerated, each RST inventory is processed
-independently. This creates separate motif files and manifests per standard:
+The default UniRST motif workflow uses M3 and M6 only. Each RST inventory is
+processed independently, with parsed graphs below `data/unirst` and motif
+catalogs below `data/motifs`:
 
 ```bash
-python 2_extract_single_triads.py --root data/unirst
-python 3_extract_double_triads.py --root data/unirst
-python 4_extract_triple_triads.py --root data/unirst
+python 2_extract_single_triads.py --data-dir data
+python 3_extract_double_triads.py --data-dir data
 ```
 
-All three commands discover the `rel-*` directories and process every relation
-inventory by default. Pass `--relinventory` to any command to process only one;
-with that option, `--motif-dir` names the exact inventory directory.
+M6 selection can independently require scene support, require cross-shard
+support, and retain only a cumulative fraction of the surviving scene hits.
+For example, the pruning profile discussed above is:
 
-Each final triad command writes a matching
-`hc3-mage_selected-motif-hashes.generated.json`. The distribution stage can
-then be run once per standard:
+```bash
+python 3_extract_double_triads.py --data-dir data \
+  --min-scene-support 10 \
+  --min-shard-support 2 \
+  --coverage 0.95
+```
+
+Support thresholds are applied first. Coverage then keeps the smallest
+frequency-ranked prefix accounting for the requested fraction of the
+surviving support. Defaults are `1`, `1`, and `1.0`, preserving the unpruned
+workflow. Each inventory also receives an `hc3_M6_support.json` audit file.
+
+Both commands discover the `rel-*` directories and process every relation
+inventory by default. Pass `--relinventory` to process only one; with that
+option, `--motif-dir` names the exact inventory directory. The default dataset
+prefix is `hc3`, matching the per-inventory files below. Pass
+`--dataset-name hc3-mage` when extracting a combined HC3/MAGE catalog. Input
+discovery follows this value: `hc3` reads `hc3_*` shards, `mage` reads
+`mage_*`, and `hc3-mage` reads both.
+
+The M6 command writes a matching M3+M6 selection manifest, so M9 extraction is
+not a prerequisite for the distribution stage. The resulting layout is:
 
 ```text
 data/motifs/
 ├── eng.erst.gum/
+│   ├── hc3_M3_motifs.json
+│   ├── hc3_M6_motifs.json
+│   ├── hc3_M6_support.json
+│   └── hc3_selected-motif-hashes.generated.json
 ├── eng.rst.rstdt/
 ├── deu.rst.pcc/
 └── nld.rst.nldt/
 ```
 
 ```bash
-python 5_add_motif_dists_to_unirst_datasets.py --root data/unirst
+python 5_add_motif_dists_to_unirst_datasets.py --data-dir data
 ```
 
-The generated manifest selects hashes from that standard's motif files.
+Script 5 loads only the `m3` and `m6` manifest entries and writes only those
+two distribution groups. Existing manifests that also contain `m9` remain
+valid; the extra entry is ignored. The generated manifest selects hashes from
+that standard's M3 and M6 files.
 Pass `--selected-hashes` to use a curated manifest instead; stale manifests
 are rejected with an actionable error.
+
+Distribution filenames end in `.m3_m6_motif_dists.jsonl`. The explicit feature
+set prevents an older M3+M6+M9 output from being mistaken for a completed
+M3+M6 artifact and skipped.
+
+`4_extract_triple_triads.py` remains available for optional M9 experiments, but
+it is deliberately not part of the default UniRST workflow.
 
 Motif distributions are written incrementally to `*.partial` files and moved
 atomically to their final paths when complete. Existing final outputs are

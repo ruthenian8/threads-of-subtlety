@@ -5,6 +5,7 @@ import random
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import networkx as nx
@@ -23,7 +24,9 @@ from transformers import (
 from transformers.tokenization_utils_base import PaddingStrategy
 
 from .tos_utils import (
+    connected_three_node_subgraphs,
     load_json,
+    node_link_graph_compat,
     resolve_selected_motif_hashes,
     split_list_into_n_chunks,
     validate_selected_motif_hashes,
@@ -65,6 +68,13 @@ class MotifMetadata:
     edge_label_counts: Dict[str, int]
     in_degrees: Tuple[int, ...]
     out_degrees: Tuple[int, ...]
+
+
+@dataclass
+class MotifCatalogIndex:
+    motifs: List[MotifMetadata]
+    hash_buckets: Dict[str, List[int]]
+    automorphism_counts: Tuple[int, ...]
 
 
 @dataclass
@@ -540,6 +550,149 @@ class ToSDataset:
         return metadata
 
     @staticmethod
+    def prepare_motif_catalog_index(
+        graph_motifs: Iterable[Union[nx.DiGraph, MotifMetadata]]
+    ) -> MotifCatalogIndex:
+        """Index a selected catalog once for occurrence-driven matching."""
+        motifs = ToSDataset.prepare_motif_metadata(graph_motifs)
+        hash_buckets: Dict[str, List[int]] = defaultdict(list)
+        automorphism_counts = []
+        edge_match = lambda left, right: left["label_0"] == right["label_0"]
+        for index, metadata in enumerate(motifs):
+            motif_hash = nx.weisfeiler_lehman_graph_hash(
+                metadata.graph, edge_attr="label_0"
+            )
+            hash_buckets[motif_hash].append(index)
+            matcher = nx.algorithms.isomorphism.DiGraphMatcher(
+                metadata.graph,
+                metadata.graph,
+                edge_match=edge_match,
+            )
+            automorphism_counts.append(
+                sum(1 for _ in matcher.isomorphisms_iter())
+            )
+        return MotifCatalogIndex(
+            motifs=motifs,
+            hash_buckets=dict(hash_buckets),
+            automorphism_counts=tuple(automorphism_counts),
+        )
+
+    @staticmethod
+    def _indexed_motif_match(
+        candidate: nx.DiGraph, catalog: MotifCatalogIndex
+    ) -> Optional[int]:
+        motif_hash = nx.weisfeiler_lehman_graph_hash(
+            candidate, edge_attr="label_0"
+        )
+        edge_match = lambda left, right: left["label_0"] == right["label_0"]
+        for index in catalog.hash_buckets.get(motif_hash, ()):
+            matcher = nx.algorithms.isomorphism.DiGraphMatcher(
+                candidate,
+                catalog.motifs[index].graph,
+                edge_match=edge_match,
+            )
+            if matcher.is_isomorphic():
+                return index
+        return None
+
+    @staticmethod
+    def _finalize_observed_distribution(
+        hist: np.ndarray,
+        total_depth: np.ndarray,
+        diameter: int,
+    ) -> Dict[str, np.ndarray]:
+        wad = np.full(hist.shape, -1.0, dtype=float)
+        present = hist > 0
+        wad[present] = total_depth[present] / hist[present] / diameter
+        total = np.sum(hist)
+        motif_freqs = hist / total if total > 0 else hist.copy()
+        return {
+            "raw": hist.tolist(),
+            "mf": motif_freqs.tolist(),
+            "wad": wad.tolist(),
+        }
+
+    @staticmethod
+    def calculate_observed_m3_m6_distributions(
+        G: nx.DiGraph,
+        motif_catalogs: Dict[str, MotifCatalogIndex],
+        root_label: str,
+    ) -> Dict[str, Dict[str, np.ndarray]]:
+        """Calculate exact M3/M6 distributions from observed occurrences.
+
+        The reference implementation tries every catalog motif against the
+        scene.  Here each induced occurrence is enumerated once and resolved
+        through a WL-hash bucket plus exact isomorphism.  Automorphism counts
+        preserve GraphMatcher's mapping-count semantics.
+        """
+        if set(motif_catalogs) != {"m3", "m6"}:
+            raise ValueError("Occurrence-driven calculation requires m3 and m6")
+        m3_catalog = motif_catalogs["m3"]
+        m6_catalog = motif_catalogs["m6"]
+        if any(motif.node_count != 3 for motif in m3_catalog.motifs) or any(
+            motif.node_count != 5 for motif in m6_catalog.motifs
+        ):
+            raise ValueError("Occurrence-driven catalogs must contain M3/M6 graphs")
+
+        context = ToSDataset.prepare_motif_graph_context(G, root_label)
+        histograms = {
+            name: np.zeros(len(catalog.motifs), dtype=float)
+            for name, catalog in motif_catalogs.items()
+        }
+        depth_totals = {
+            name: np.zeros(len(catalog.motifs), dtype=float)
+            for name, catalog in motif_catalogs.items()
+        }
+
+        occurrences_by_node = defaultdict(list)
+        for candidate in connected_three_node_subgraphs(G):
+            nodes = frozenset(candidate)
+            occurrence = (nodes, candidate)
+            for node in nodes:
+                occurrences_by_node[node].append(occurrence)
+
+            motif_index = ToSDataset._indexed_motif_match(candidate, m3_catalog)
+            if motif_index is None:
+                continue
+            multiplicity = m3_catalog.automorphism_counts[motif_index]
+            mean_depth = np.mean(
+                [context.root_distances[node] for node in nodes]
+            )
+            histograms["m3"][motif_index] += multiplicity
+            depth_totals["m3"][motif_index] += multiplicity * mean_depth
+
+        seen_five_node_sets = set()
+        for shared_occurrences in occurrences_by_node.values():
+            for (left_nodes, _), (right_nodes, _) in combinations(
+                shared_occurrences, 2
+            ):
+                if len(left_nodes & right_nodes) != 1:
+                    continue
+                nodes = left_nodes | right_nodes
+                if nodes in seen_five_node_sets:
+                    continue
+                seen_five_node_sets.add(nodes)
+                candidate = G.subgraph(nodes).copy()
+                motif_index = ToSDataset._indexed_motif_match(
+                    candidate, m6_catalog
+                )
+                if motif_index is None:
+                    continue
+                multiplicity = m6_catalog.automorphism_counts[motif_index]
+                mean_depth = np.mean(
+                    [context.root_distances[node] for node in nodes]
+                )
+                histograms["m6"][motif_index] += multiplicity
+                depth_totals["m6"][motif_index] += multiplicity * mean_depth
+
+        return {
+            name: ToSDataset._finalize_observed_distribution(
+                histograms[name], depth_totals[name], context.diameter
+            )
+            for name in ("m3", "m6")
+        }
+
+    @staticmethod
     def prepare_motif_graph_context(
         G: nx.DiGraph, root_label: str
     ) -> MotifGraphContext:
@@ -695,9 +848,7 @@ class ToSDataset:
                 for tree in document.scene_discourse_trees.values():
                     if tree is None:
                         continue
-                    tree.graph_networkx = nx.json_graph.node_link_graph(
-                        tree.graph_dict
-                    )
+                    tree.graph_networkx = node_link_graph_compat(tree.graph_dict)
                 yield document
 
     @staticmethod
@@ -736,13 +887,13 @@ class ToSDataset:
             if selected_hashes:
                 motif_graphs.extend(
                     [
-                        nx.json_graph.node_link_graph(_motifs[hash])
+                        node_link_graph_compat(_motifs[hash])
                         for hash in selected_hashes
                     ]
                 )
             else:
                 motif_graphs.extend(
-                    [nx.json_graph.node_link_graph(v) for v in _motifs.values()]
+                    [node_link_graph_compat(v) for v in _motifs.values()]
                 )
         print(f"loaded motif graphs: {len(motif_graphs)}")
         return motif_graphs

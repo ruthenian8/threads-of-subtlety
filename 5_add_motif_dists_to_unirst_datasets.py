@@ -1,10 +1,10 @@
-"""Add the paper's motif distributions to UniRST graph outputs."""
+"""Add per-inventory M3 and M6 distributions to UniRST graph outputs."""
 
 from __future__ import annotations
 
 import argparse
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import glob
 from itertools import islice
 import os
@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 from tos.tos_dataset import (
     DiscourseMotifDists,
     Document,
-    MotifMetadata,
+    MotifCatalogIndex,
     ToSDataset,
 )
 from tos.tos_utils import (
@@ -30,10 +30,15 @@ from tos.tos_utils import (
 random.seed(42)
 
 
-_WORKER_MOTIFS: Optional[Dict[int, List[MotifMetadata]]] = None
+MOTIF_SIZES = (3, 6)
+MOTIF_GROUP_NAMES = tuple(f"m{size}" for size in MOTIF_SIZES)
+MOTIF_SET_NAME = "_".join(MOTIF_GROUP_NAMES)
 
 
-def _init_motif_worker(motifs: Dict[int, List[MotifMetadata]]) -> None:
+_WORKER_MOTIFS: Optional[Dict[str, MotifCatalogIndex]] = None
+
+
+def _init_motif_worker(motifs: Dict[str, MotifCatalogIndex]) -> None:
     """Initialize motif collections once in each process-pool worker."""
     global _WORKER_MOTIFS
     _WORKER_MOTIFS = motifs
@@ -46,12 +51,7 @@ def _add_motif_dist_to_document_batch_worker(
         raise RuntimeError("motif worker was not initialized")
     processed = []
     for document in documents:
-        document = add_motif_dist_to_document(
-            document,
-            _WORKER_MOTIFS[3],
-            _WORKER_MOTIFS[6],
-            _WORKER_MOTIFS[9],
-        )
+        document = add_motif_dist_to_document(document, _WORKER_MOTIFS)
         # graph_dict is the persisted representation. Avoid sending duplicate
         # NetworkX objects back to the parent process.
         for tree in document.scene_discourse_trees.values():
@@ -63,19 +63,28 @@ def _add_motif_dist_to_document_batch_worker(
 
 def add_motif_dist_to_document(
     document: Document,
-    m3_motifs: List,
-    m6_motifs: List,
-    m9_motifs: List,
+    motif_groups,
 ) -> Document:
     for tree in document.scene_discourse_trees.values():
         if tree is None:
             continue
         root_label = f"span_1-{len(tree.edus)}"
-        distributions = ToSDataset.calculate_motif_distributions(
-            tree.graph_networkx,
-            {"m3": m3_motifs, "m6": m6_motifs, "m9": m9_motifs},
-            root_label,
-        )
+        if all(
+            isinstance(group, MotifCatalogIndex)
+            for group in motif_groups.values()
+        ):
+            distributions = ToSDataset.calculate_observed_m3_m6_distributions(
+                tree.graph_networkx,
+                motif_groups,
+                root_label,
+            )
+        else:
+            # Retain the generic path for callers supplying arbitrary groups.
+            distributions = ToSDataset.calculate_motif_distributions(
+                tree.graph_networkx,
+                motif_groups,
+                root_label,
+            )
         tree.motif_dists = {
             name: DiscourseMotifDists(**distribution)
             for name, distribution in distributions.items()
@@ -118,13 +127,82 @@ def iter_processed_documents(
         )
 
 
+def iter_processed_documents_as_completed(
+    executor: ProcessPoolExecutor,
+    documents: Iterable[Document],
+    batch_size: int,
+    max_pending_batches: int,
+) -> Iterator[Document]:
+    """Keep workers busy by yielding batches as soon as they complete.
+
+    Document order is not semantically relevant to the generated training
+    corpus.  Consuming completion order avoids a single complex document
+    blocking the parent while every other worker is idle.
+    """
+    batches = iter(_batched(documents, batch_size))
+    pending = set()
+    for batch in islice(batches, max_pending_batches):
+        pending.add(
+            executor.submit(_add_motif_dist_to_document_batch_worker, batch)
+        )
+
+    while pending:
+        completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+        for future in completed:
+            processed_batch = future.result()
+            try:
+                batch = next(batches)
+            except StopIteration:
+                pass
+            else:
+                pending.add(
+                    executor.submit(
+                        _add_motif_dist_to_document_batch_worker, batch
+                    )
+                )
+            yield from processed_batch
+
+
 def count_documents(file_path: str) -> int:
     with open(file_path) as handle:
         return sum(1 for line in handle if line.strip())
 
 
 def output_path_for(file_path: str) -> str:
-    return f"{os.path.splitext(file_path)[0]}.motif_dists.jsonl"
+    # Include the feature-set name so an existing M3+M6+M9 output cannot be
+    # mistaken for a completed M3+M6 artifact and skipped.
+    return f"{os.path.splitext(file_path)[0]}.{MOTIF_SET_NAME}_motif_dists.jsonl"
+
+
+def resolve_dataset_root(args) -> str:
+    return args.root or os.path.join(args.data_dir, "unirst")
+
+
+def resolve_motif_dir(args, relinventory: str) -> str:
+    inventory_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", relinventory)
+    motif_root = args.motif_dir or os.path.join(args.data_dir, "motifs")
+    if args.relinventory is not None and args.motif_dir:
+        return args.motif_dir
+    return os.path.join(motif_root, inventory_name)
+
+
+def discover_graph_files(
+    dataset_root: str, inventory_dir: str, dataset_name: str
+) -> List[str]:
+    prefixes = ("hc3", "mage") if dataset_name == "hc3-mage" else (dataset_name,)
+    return sorted(
+        {
+            path
+            for prefix in prefixes
+            for path in glob.glob(
+                os.path.join(
+                    dataset_root,
+                    inventory_dir,
+                    f"{prefix}_*.discourse_parsed.graph_added.jsonl",
+                )
+            )
+        }
+    )
 
 
 def pending_output_files(file_paths: Iterable[str], force: bool):
@@ -147,7 +225,7 @@ def write_motif_distributions(
 ) -> None:
     temporary_path = f"{output_path}.partial"
     documents = ToSDataset.iter_document_corpus(file_path)
-    processed = iter_processed_documents(
+    processed = iter_processed_documents_as_completed(
         executor,
         documents,
         batch_size=chunksize,
@@ -173,14 +251,30 @@ def write_motif_distributions(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default="data/unirst")
-    parser.add_argument("--motif-dir", default=None)
+    parser.add_argument(
+        "--data-dir",
+        default="data",
+        help="Top-level data directory containing unirst/ and motifs/.",
+    )
+    parser.add_argument(
+        "--root",
+        default=None,
+        help="Override the default <data-dir>/unirst dataset root.",
+    )
+    parser.add_argument(
+        "--motif-dir",
+        default=None,
+        help=(
+            "Override <data-dir>/motifs. With --relinventory, this is the "
+            "exact inventory catalog directory."
+        ),
+    )
     parser.add_argument(
         "--relinventory",
         default=None,
         help="Process one RST inventory with its standard-specific motif set.",
     )
-    parser.add_argument("--dataset-name", default="hc3-mage")
+    parser.add_argument("--dataset-name", default="hc3")
     parser.add_argument(
         "--selected-hashes",
         default=None,
@@ -204,36 +298,29 @@ def main() -> None:
     if args.chunksize < 1:
         parser.error("--chunksize must be at least 1")
 
-    inventories = [args.relinventory] if args.relinventory else [None]
-    if args.relinventory is None:
-        inventory_dirs = sorted(glob.glob(os.path.join(args.root, "rel-*")))
+    dataset_root = resolve_dataset_root(args)
+    if args.relinventory is not None:
+        inventories = [args.relinventory]
+    else:
+        inventory_dirs = sorted(glob.glob(os.path.join(dataset_root, "rel-*")))
         inventories = [
             os.path.basename(path)[len("rel-") :]
             for path in inventory_dirs
             if os.path.isdir(path)
-        ] or [None]
+        ]
+    if not inventories:
+        raise FileNotFoundError(
+            f"No rel-* inventory directories found below {dataset_root!r}"
+        )
 
     for relinventory in inventories:
-        inventory_name = (
-            re.sub(r"[^A-Za-z0-9_.-]+", "_", relinventory)
-            if relinventory
-            else None
-        )
-        motif_dir = (
-            os.path.join(args.motif_dir, inventory_name)
-            if args.motif_dir and args.relinventory is None and inventory_name
-            else args.motif_dir
-            or (
-                os.path.join("data/motifs", inventory_name)
-                if inventory_name
-                else "data/motifs"
-            )
-        )
-        inventory_dir = f"rel-{inventory_name}" if inventory_name else "rel-*"
-        files = glob.glob(
-            os.path.join(
-                args.root, inventory_dir, "*.discourse_parsed.graph_added.jsonl"
-            )
+        inventory_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", relinventory)
+        motif_dir = resolve_motif_dir(args, relinventory)
+        inventory_dir = f"rel-{inventory_name}"
+        files = discover_graph_files(
+            dataset_root,
+            inventory_dir,
+            args.dataset_name,
         )
         pending_files = pending_output_files(files, args.force)
         if not pending_files:
@@ -244,10 +331,13 @@ def main() -> None:
         )
         selected = load_json(selected_manifest)
         validate_selected_motif_hashes(
-            motif_dir, selected, dataset_name=args.dataset_name
+            motif_dir,
+            selected,
+            dataset_name=args.dataset_name,
+            sizes=MOTIF_SIZES,
         )
         motifs = {
-            size: ToSDataset.prepare_motif_metadata(
+            group_name: ToSDataset.prepare_motif_catalog_index(
                 ToSDataset.load_motifs(
                     os.path.join(
                         motif_dir, f"{args.dataset_name}_M{size}_motifs.json"
@@ -255,7 +345,7 @@ def main() -> None:
                     selected[f"m{size}"],
                 )
             )
-            for size in (3, 6, 9)
+            for size, group_name in zip(MOTIF_SIZES, MOTIF_GROUP_NAMES)
         }
 
         # Keep one pool alive for every shard in this relation inventory. Motif
