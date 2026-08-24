@@ -17,7 +17,9 @@ import re
 import tempfile
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
+from sentsplit.segment import SentSplit
 from tqdm.auto import tqdm
+from transformers import AutoTokenizer
 
 if TYPE_CHECKING:
     from .tos_dataset import Document, SceneDiscourseTree
@@ -33,10 +35,64 @@ DEFAULT_REL_INVENTORIES = (
 SEGMENTATION_CHECKPOINT_INTERVAL = 100
 
 
+class SceneSplitter:
+    """Split documents at the parser token limit for every UniRST workflow."""
+
+    def __init__(self, max_tokens_margin: int = 20):
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "xlm-roberta-base", use_fast=True
+        )
+        self.max_tokens = self.tokenizer.model_max_length - max_tokens_margin
+        self.sent_splitter = SentSplit("en")
+
+    def split(self, document: str) -> List[str]:
+        paragraphs = document.split("\n\n")
+        scenes: List[str] = []
+        current_scene = ""
+        current_token_count = 0
+
+        for paragraph in paragraphs:
+            token_count = len(self.tokenizer.tokenize(paragraph))
+            if token_count > self.max_tokens:
+                sentences = self.sent_splitter.segment(paragraph, strip_spaces=False)
+                for sentence in sentences:
+                    token_count = len(self.tokenizer.tokenize(sentence))
+                    if current_token_count + token_count > self.max_tokens:
+                        if current_scene.strip():
+                            scenes.append(current_scene.strip())
+                        current_scene = sentence
+                        current_token_count = token_count
+                    else:
+                        current_scene += sentence
+                        current_token_count += token_count
+                if current_scene.strip():
+                    scenes.append(current_scene.strip())
+                current_scene = ""
+                current_token_count = 0
+                continue
+
+            if current_token_count + token_count > self.max_tokens:
+                if current_scene.strip():
+                    scenes.append(current_scene.strip())
+                current_scene = paragraph
+                current_token_count = token_count
+            else:
+                if current_scene:
+                    current_scene += "\n\n"
+                current_scene += paragraph
+                current_token_count += token_count
+
+        if current_scene.strip():
+            scenes.append(current_scene.strip())
+        return scenes
+
+
 class UniRSTAdapter:
     """Adapter around UniRST segmentation and EDU-based parsing."""
 
-    cache_schema_version = 1
+    # Version 2 records segmentation produced by offset-based subword/word
+    # alignment; invalidate v1 caches that may contain strict-alignment errors.
+    cache_schema_version = 2
 
     def __init__(
         self,
@@ -120,7 +176,9 @@ class UniRSTAdapter:
         cursor backwards when a predicted EDU consists of exactly one word,
         after which its unbounded alignment loop never makes progress.  This
         bounded implementation requires every EDU to consume at least one
-        complete gold token and fails explicitly on an unalignable boundary.
+        complete gold token. If decoded subword text ends inside a word, the
+        boundary is rounded forward, matching the converter's intended
+        whole-token behavior without its non-terminating cursor bug.
         """
         boundaries: List[int] = []
         start_token = 0
@@ -146,13 +204,6 @@ class UniRSTAdapter:
                     f"{target_length} non-whitespace characters, but only "
                     f"{candidate_length} remain"
                 )
-            if candidate_length != target_length:
-                raise ValueError(
-                    f"Predicted EDU {segment_index} ends inside a gold token: "
-                    f"expected {target_length} non-whitespace characters, "
-                    f"reached {candidate_length}"
-                )
-
             boundaries.append(end_token)
             start_token = end_token
 
@@ -176,6 +227,57 @@ class UniRSTAdapter:
             fixed_segments.append(" ".join(gold_tokens[start_token:end_token]).strip())
             start_token = end_token
         return fixed_segments
+
+    @staticmethod
+    def _align_subword_breaks_to_words(
+        predicted_breaks: Sequence[int],
+        subword_offsets: Sequence[Sequence[int]],
+        gold_tokens: Sequence[str],
+    ) -> List[int]:
+        """Map predicted subword ends to exclusive complete-word boundaries.
+
+        UniRST predicts EDU breaks over tokenizer subwords.  Reconstructing
+        those subwords as text is lossy for unknown/normalized characters and
+        can make a valid subword break appear to end inside a Razdel token.
+        The fast tokenizer's character offsets are authoritative: a break
+        inside a word is rounded forward to that word's end, and duplicate
+        rounded boundaries are merged so every EDU consumes at least one word.
+        """
+        if not gold_tokens:
+            raise ValueError("Cannot align subword breaks without gold tokens")
+
+        word_ends: List[int] = []
+        character_cursor = 0
+        for token in gold_tokens:
+            character_cursor += len(token)
+            word_ends.append(character_cursor)
+            character_cursor += 1  # Predictor tokenization joins words with one space.
+
+        boundaries: List[int] = []
+        word_index = 0
+        for break_index in predicted_breaks:
+            if break_index < 0 or break_index >= len(subword_offsets):
+                raise ValueError(f"Predicted subword break {break_index} is out of range")
+            offset = subword_offsets[break_index]
+            if len(offset) != 2:
+                raise ValueError("Tokenizer returned an invalid offset mapping")
+            end_character = int(offset[1])
+            if end_character <= 0:
+                raise ValueError("Predicted EDU ends at an empty tokenizer offset")
+
+            while word_index < len(word_ends) and word_ends[word_index] < end_character:
+                word_index += 1
+            if word_index >= len(word_ends):
+                raise ValueError(
+                    f"Predicted EDU ends beyond the final word at character {end_character}"
+                )
+            boundary = word_index + 1
+            if not boundaries or boundary > boundaries[-1]:
+                boundaries.append(boundary)
+
+        if not boundaries or boundaries[-1] != len(gold_tokens):
+            raise ValueError("Predicted EDU boundaries do not consume all gold tokens")
+        return boundaries
 
     @staticmethod
     def _segment_with_unirst_predictor(predictor: Any, text: str) -> List[str]:
@@ -261,22 +363,24 @@ class UniRSTAdapter:
                 "UniRST returned invalid or incomplete predicted EDU boundaries"
             )
 
-        # Align subword segments to complete Razdel tokens with a bounded
-        # cursor, then slice the original scene so punctuation and whitespace
-        # are preserved without invoking DUConverter's unbounded loop.
-        subword_tokens = tokenizer.convert_ids_to_tokens(input_ids)
-        predicted_segments: List[str] = []
-        previous_break = 0
-        for predicted_break in predicted_breaks:
-            predicted_segments.append(
-                "".join(subword_tokens[previous_break : predicted_break + 1])
-                .replace("▁", " ")
-                .strip()
+        # Recompute the fast-tokenizer offsets discarded by Predictor.tokenize
+        # and use them directly. This preserves word boundaries even when
+        # decoding subwords changes character counts (e.g. Unicode or <unk>).
+        normalized_text = " ".join(word_tokens).strip()
+        tokenized_with_offsets = tokenizer(
+            normalized_text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        offset_input_ids = tokenized_with_offsets["input_ids"]
+        if list(offset_input_ids) != list(input_ids):
+            raise RuntimeError(
+                "UniRST tokenizer produced inconsistent IDs while recovering offsets"
             )
-            previous_break = predicted_break + 1
-
-        word_boundaries = UniRSTAdapter._align_predicted_segments(
-            predicted_segments, word_tokens
+        word_boundaries = UniRSTAdapter._align_subword_breaks_to_words(
+            predicted_breaks,
+            tokenized_with_offsets["offset_mapping"],
+            word_tokens,
         )
         edus: List[str] = []
         start_token = 0

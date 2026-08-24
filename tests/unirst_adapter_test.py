@@ -80,6 +80,19 @@ class FakeTokenizer:
     def convert_ids_to_tokens(self, input_ids):
         return ["▁First", "▁EDU", ".", "▁Second", "▁EDU", "."]
 
+    def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+        return {
+            "input_ids": list(range(6)),
+            "offset_mapping": [
+                (0, 5),
+                (6, 9),
+                (10, 11),
+                (12, 18),
+                (19, 22),
+                (23, 24),
+            ],
+        }
+
 
 class FakePredictor:
     def __init__(self):
@@ -152,6 +165,25 @@ class UniRSTAdapterTest(unittest.TestCase):
         self.assertEqual(FakeParser.calls, 0)
         self.assertEqual(FakeParser.segmentation_calls, 1)
 
+    def test_segmentation_alignment_failure_is_cached_and_does_not_abort(self):
+        adapter = self.make_adapter()
+
+        def fail_alignment(_text):
+            raise ValueError(
+                "Predicted EDU 4 ends inside a gold token: expected 48, reached 52"
+            )
+
+        adapter.segment_scene = fail_alignment
+        scenes = [{"scene_key": "mage:ood:0:0", "text": "problematic text"}]
+        with tempfile.TemporaryDirectory() as directory:
+            result = load_or_create_segmentation_cache(
+                adapter, scenes, os.path.join(directory, "segments.pkl")
+            )
+
+        self.assertEqual(result[0]["status"], "error")
+        self.assertEqual(result[0]["edus"], [])
+        self.assertIn("ends inside a gold token", result[0]["error"])
+
     def test_segmentation_does_not_invoke_full_parser(self):
         adapter = self.make_adapter()
 
@@ -202,12 +234,22 @@ class UniRSTAdapterTest(unittest.TestCase):
 
         self.assertEqual(fixed, ["Formats", "that allow older cards"])
 
-    def test_alignment_rejects_boundary_inside_gold_token(self):
-        with self.assertRaisesRegex(ValueError, "ends inside a gold token"):
-            UniRSTAdapter._align_predicted_segments(
-                ["Format"],
-                ["Formats"],
-            )
+    def test_alignment_rounds_boundary_to_complete_gold_token(self):
+        boundaries = UniRSTAdapter._align_predicted_segments(
+            ["x" * 48],
+            ["x" * 52],
+        )
+
+        self.assertEqual(boundaries, [1])
+
+    def test_subword_offsets_round_breaks_to_complete_words(self):
+        boundaries = UniRSTAdapter._align_subword_breaks_to_words(
+            predicted_breaks=[0, 1, 2],
+            subword_offsets=[(0, 2), (2, 5), (6, 11)],
+            gold_tokens=["hello", "world"],
+        )
+
+        self.assertEqual(boundaries, [1, 2])
 
     def test_single_edu_is_marked_none(self):
         result = {"rst": [Unit(text="Only EDU.")]}

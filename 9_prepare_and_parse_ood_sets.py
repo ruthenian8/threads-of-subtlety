@@ -6,18 +6,23 @@ The old ``data/mage`` input/output layout remains the default.
 """
 
 import argparse
+import gc
 import os
 import random
 import re
-from collections import OrderedDict
+from typing import Any, Dict, List, Mapping, Sequence
 
 import pandas as pd
 from rich.progress import track
-from sentsplit.segment import SentSplit
-from transformers import AutoTokenizer
+from tqdm.auto import tqdm
 
-from tos.tos_dataset import Document, ToSDataset
-from tos.unirst import UniRSTAdapter
+from tos.tos_dataset import Document, SceneDiscourseTree, ToSDataset
+from tos.unirst import (
+    SceneSplitter,
+    UniRSTAdapter,
+    build_scene_lookup,
+    load_or_create_segmentation_cache,
+)
 from tos.tos_utils import (
     load_json,
     resolve_selected_motif_hashes,
@@ -29,45 +34,6 @@ random.seed(42)
 
 def _safe_inventory_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
-
-
-class SceneSplitter:
-    """Use the same scene boundaries as the UniRST preparation workflow."""
-
-    def __init__(self, max_tokens_margin=20):
-        self.tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base", use_fast=True)
-        self.max_tokens = self.tokenizer.model_max_length - max_tokens_margin
-        self.sent_splitter = SentSplit("en")
-
-    def split(self, document):
-        scenes, current, current_tokens = [], "", 0
-        for paragraph in document.split("\n\n"):
-            paragraph_tokens = len(self.tokenizer.tokenize(paragraph))
-            if paragraph_tokens > self.max_tokens:
-                pieces = self.sent_splitter.segment(paragraph, strip_spaces=False)
-                for piece in pieces:
-                    piece_tokens = len(self.tokenizer.tokenize(piece))
-                    if current_tokens + piece_tokens > self.max_tokens:
-                        if current.strip():
-                            scenes.append(current.strip())
-                        current, current_tokens = piece, piece_tokens
-                    else:
-                        current += piece
-                        current_tokens += piece_tokens
-                if current.strip():
-                    scenes.append(current.strip())
-                current, current_tokens = "", 0
-                continue
-            if current_tokens + paragraph_tokens > self.max_tokens:
-                if current.strip():
-                    scenes.append(current.strip())
-                current, current_tokens = paragraph, paragraph_tokens
-            else:
-                current = f"{current}\n\n{paragraph}" if current else paragraph
-                current_tokens += paragraph_tokens
-        if current.strip():
-            scenes.append(current.strip())
-        return scenes
 
 
 def load_unirst_motifs(motif_dir, dataset_name, motif_sizes):
@@ -85,49 +51,187 @@ def load_unirst_motifs(motif_dir, dataset_name, motif_sizes):
     }
 
 
-def parse_unirst_document(text, source, label, adapter, parser, splitter, motifs):
-    scenes = splitter.split(text)
-    trees = OrderedDict()
-    kept_scenes = []
-    for scene_text in scenes:
-        segmented = adapter.segment_scene(scene_text)
-        if len(segmented["edus"]) < 2:
-            continue
-        result = parser.from_edus(segmented["edus"])
-        trees[len(kept_scenes)] = adapter.scene_tree(
-            scene_text, segmented["edus"], result
+def make_document_specs(df, split: str, splitter: SceneSplitter) -> List[Dict[str, Any]]:
+    """Convert an OOD frame to script-0-compatible document specifications."""
+    documents = []
+    for document_index, row in tqdm(
+        df.iterrows(), total=len(df), desc=f"preparing MAGE {split}", unit="document"
+    ):
+        text = row["text"]
+        documents.append(
+            {
+                "dataset": "mage",
+                "split": split,
+                "document_index": int(document_index),
+                "text": text,
+                "source": row.get("src"),
+                "label": row.get("label"),
+                "scenes": splitter.split(text),
+            }
         )
-        kept_scenes.append(scene_text)
-    if not trees:
-        return None
-    document = Document(
-        text=text,
-        scenes=kept_scenes,
-        scene_discourse_trees=trees,
-        source=source,
-        label=label,
-    )
-    document = ToSDataset.add_discourse_graphs_to_document(document)
-    document = ToSDataset.add_motif_distributions_to_document(
-        document,
-        **{f"m{size}_motifs": motifs[size] for size in motifs},
-    )
-    return document
+    return documents
 
 
-def process_df(df, tos_dataset=None, *, adapter=None, parser=None, splitter=None, motifs=None):
+def make_scene_specs(documents: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    scene_specs = []
+    for document in documents:
+        for scene_index, text in enumerate(document["scenes"]):
+            scene_specs.append(
+                {
+                    "scene_key": ":".join(
+                        (
+                            document["dataset"],
+                            document["split"],
+                            str(document["document_index"]),
+                            str(scene_index),
+                        )
+                    ),
+                    "dataset": document["dataset"],
+                    "split": document["split"],
+                    "document_index": document["document_index"],
+                    "scene_index": scene_index,
+                    "text": text,
+                }
+            )
+    return scene_specs
+
+
+def parse_predictions(adapter, scenes, relinventory):
+    """Mirror script 0: record per-scene errors instead of aborting the run."""
+    predictions = {}
+    parser = adapter.make_parser(relinventory)
+    try:
+        for scene in tqdm(
+            scenes,
+            desc=f"parsing {relinventory}",
+            unit="scene",
+            total=len(scenes),
+        ):
+            if scene["status"] != "ok":
+                predictions[scene["scene_key"]] = {
+                    "status": "segmentation_error",
+                    "parsed": "NONE",
+                    "error": scene["error"],
+                }
+                continue
+            try:
+                result = parser.from_edus(scene["edus"])
+                predictions[scene["scene_key"]] = {
+                    "status": "ok",
+                    "parsed": adapter.to_constituency_format(result, len(scene["edus"])),
+                    "error": None,
+                }
+            except Exception as exc:
+                predictions[scene["scene_key"]] = {
+                    "status": "error",
+                    "parsed": "NONE",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+    finally:
+        del parser
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+    return predictions
+
+
+def feature_documents(documents, scenes, predictions, motifs):
+    """Assemble graph/motif documents, filtering failed trees like script 1."""
+    scene_lookup = build_scene_lookup(scenes)
+    output = []
+    skipped_scenes = 0
+    for document_spec in documents:
+        kept_scenes = []
+        trees = {}
+        for scene_index, scene_text in enumerate(document_spec["scenes"]):
+            scene_key = ":".join(
+                (
+                    document_spec["dataset"],
+                    document_spec["split"],
+                    str(document_spec["document_index"]),
+                    str(scene_index),
+                )
+            )
+            record = scene_lookup[scene_key]
+            prediction = predictions[scene_key]
+            if record["status"] != "ok" or prediction["parsed"] in {"NONE", ""}:
+                skipped_scenes += 1
+                continue
+            edus = {
+                f"span_{index}-{index}": edu
+                for index, edu in enumerate(record["edus"], start=1)
+            }
+            trees[len(trees)] = SceneDiscourseTree(
+                text=scene_text,
+                tokenized=record["tokenized"],
+                segments=record["segments"],
+                edus=edus,
+                parsed=prediction["parsed"],
+                graph_dict=None,
+                graph_networkx=None,
+                motif_dists=None,
+            )
+            kept_scenes.append(scene_text)
+        if not trees:
+            continue
+        document = Document(
+            text=document_spec["text"],
+            scenes=kept_scenes,
+            scene_discourse_trees=trees,
+            source=document_spec["source"],
+            label=document_spec["label"],
+        )
+        document = ToSDataset.add_discourse_graphs_to_document(document)
+        document = ToSDataset.add_motif_distributions_to_document(
+            document,
+            **{f"m{size}_motifs": motifs[size] for size in motifs},
+        )
+        output.append(document)
+    return output, skipped_scenes
+
+
+def process_unirst_df(
+    df,
+    split,
+    adapter,
+    relinventory,
+    splitter,
+    motifs,
+    cache_path,
+    force_segmentation=False,
+):
+    documents = make_document_specs(df, split, splitter)
+    scene_specs = make_scene_specs(documents)
+    scenes = load_or_create_segmentation_cache(
+        adapter,
+        scene_specs,
+        cache_path,
+        force=force_segmentation,
+        progress_desc=f"segmenting mage_{split}",
+    )
+    adapter.release_segmenter()
+    predictions = parse_predictions(adapter, scenes, relinventory)
+    parsed, skipped_scenes = feature_documents(documents, scenes, predictions, motifs)
+    failed_documents = len(documents) - len(parsed)
+    tqdm.write(
+        f"mage_{split}: skipped {skipped_scenes} failed/empty scenes and "
+        f"{failed_documents} documents without a valid tree"
+    )
+    return parsed
+
+
+def process_df(df, tos_dataset):
     dataset = []
     for _, row in track(df.iterrows(), total=len(df), description="Processing..."):
-        if adapter is not None:
-            document = parse_unirst_document(
-                row["text"], row.get("src"), row.get("label"),
-                adapter, parser, splitter, motifs,
-            )
-        else:
-            document = tos_dataset.parse_document_discourse(
-                document=row["text"], source=row.get("src"), label=row.get("label"),
-                filter_none=True, add_graph=True, add_motif_dists=True,
-            )
+        document = tos_dataset.parse_document_discourse(
+            document=row["text"], source=row.get("src"), label=row.get("label"),
+            filter_none=True, add_graph=True, add_motif_dists=True,
+        )
         if document is not None:
             dataset.append(document)
     return dataset
@@ -145,6 +249,12 @@ def main(argv=None):
     )
     parser.add_argument("--motif-dir")
     parser.add_argument("--relinventory")
+    parser.add_argument("--segment-relinventory", default="deu.rst.pcc")
+    parser.add_argument("--segments-dir")
+    parser.add_argument("--hf-model-name", default="tchewik/isanlp_rst_v3")
+    parser.add_argument("--hf-model-version", default="unirst")
+    parser.add_argument("--force-segmentation", action="store_true")
+    parser.add_argument("--force-parsing", action="store_true")
     parser.add_argument("--dataset-name")
     parser.add_argument("--gpu-id", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=1024)
@@ -175,16 +285,17 @@ def main(argv=None):
     }
     if args.relinventory:
         adapter = UniRSTAdapter(
-            segment_relinventory=args.relinventory,
+            segment_relinventory=args.segment_relinventory,
             relation_inventories=(args.relinventory,),
+            hf_model_name=args.hf_model_name,
+            hf_model_version=args.hf_model_version,
             cuda_device=args.gpu_id if args.gpu_id is not None else -1,
         )
-        unirst_parser = adapter.make_parser(args.relinventory)
         splitter = SceneSplitter()
         motifs = load_unirst_motifs(motif_dir, dataset_name, motif_sizes)
         tos_dataset = None
     else:
-        adapter = unirst_parser = splitter = motifs = None
+        adapter = splitter = motifs = None
         tos_dataset = ToSDataset(
             dmrst_parser_dir=args.parser_dir,
             batch_size=args.batch_size,
@@ -195,18 +306,38 @@ def main(argv=None):
         )
     os.makedirs(output_dir, exist_ok=True)
     output_suffix = "m3_m6_motif_dists" if args.relinventory else "motif_dists"
+    segments_dir = args.segments_dir or os.path.join(
+        args.data_dir,
+        "unirst",
+        f"segments-{_safe_inventory_name(args.segment_relinventory)}",
+    )
     for name, input_path in input_paths.items():
         if not os.path.exists(input_path):
             raise FileNotFoundError(input_path)
-        df = pd.read_csv(input_path, header=0)
-        parsed = process_df(
-            df, tos_dataset, adapter=adapter, parser=unirst_parser,
-            splitter=splitter, motifs=motifs,
-        )
         output_path = os.path.join(
             output_dir,
             f"test_ood_set_{name}.discourse_parsed.graph_added.{output_suffix}.jsonl",
         )
+        if os.path.exists(output_path) and not (
+            args.force_segmentation or args.force_parsing
+        ):
+            print(f"skipping {name}: output exists at {output_path}")
+            continue
+        df = pd.read_csv(input_path, header=0)
+        if args.relinventory:
+            cache_path = os.path.join(segments_dir, f"mage_ood_{name}.pkl")
+            parsed = process_unirst_df(
+                df,
+                name,
+                adapter,
+                args.relinventory,
+                splitter,
+                motifs,
+                cache_path,
+                force_segmentation=args.force_segmentation,
+            )
+        else:
+            parsed = process_df(df, tos_dataset)
         ToSDataset.save_dataset_as_jsonl(parsed, output_path)
         print(f"wrote {len(parsed)} documents to {output_path}")
 

@@ -19,15 +19,14 @@ from collections import defaultdict
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from datasets import load_dataset
-from sentsplit.segment import SentSplit
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 
 from tos.tos_dataset import Document, SceneDiscourseTree
 from tos.tos_utils import split_list_into_n_chunks
 from tos.unirst import (
     DEFAULT_REL_INVENTORIES,
+    SceneSplitter,
     UniRSTAdapter,
     build_scene_lookup,
     load_or_create_segmentation_cache,
@@ -37,54 +36,6 @@ from tos.unirst import (
 
 def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
-
-
-class SceneSplitter:
-    def __init__(self, max_tokens_margin: int = 20):
-        self.tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base", use_fast=True)
-        self.max_tokens = self.tokenizer.model_max_length - max_tokens_margin
-        self.sent_splitter = SentSplit("en")
-
-    def split(self, document: str) -> List[str]:
-        paragraphs = document.split("\n\n")
-        scenes: List[str] = []
-        current_scene = ""
-        current_token_count = 0
-
-        for paragraph in paragraphs:
-            token_count = len(self.tokenizer.tokenize(paragraph))
-            if token_count > self.max_tokens:
-                sentences = self.sent_splitter.segment(paragraph, strip_spaces=False)
-                for sentence in sentences:
-                    token_count = len(self.tokenizer.tokenize(sentence))
-                    if current_token_count + token_count > self.max_tokens:
-                        if current_scene.strip():
-                            scenes.append(current_scene.strip())
-                        current_scene = sentence
-                        current_token_count = token_count
-                    else:
-                        current_scene += sentence
-                        current_token_count += token_count
-                if current_scene.strip():
-                    scenes.append(current_scene.strip())
-                current_scene = ""
-                current_token_count = 0
-                continue
-
-            if current_token_count + token_count > self.max_tokens:
-                if current_scene.strip():
-                    scenes.append(current_scene.strip())
-                current_scene = paragraph
-                current_token_count = token_count
-            else:
-                if current_scene:
-                    current_scene += "\n\n"
-                current_scene += paragraph
-                current_token_count += token_count
-
-        if current_scene.strip():
-            scenes.append(current_scene.strip())
-        return scenes
 
 
 def hc3_groups(dataset_name: str, splitter: SceneSplitter, min_char_len: int) -> Dict[str, List[Dict[str, Any]]]:

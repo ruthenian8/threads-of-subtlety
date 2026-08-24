@@ -1,5 +1,5 @@
 accelerate
-datasets<=3.6.0
+datasets<4.0.0
 evaluate
 isanlp_rst @ git+https://github.com/tchewik/isanlp_rst.git@master
 isanlp @ git+https://github.com/iinemo/isanlp.git
@@ -11,4 +11,6 @@ tqdm
 torch
 torchaudio
 torchvision
-transformers
+# Pinned for UniRST/Longformer checkpoint compatibility and the
+# TrainingArguments.evaluation_strategy API used by the training scripts.
+transformers==4.46.3
