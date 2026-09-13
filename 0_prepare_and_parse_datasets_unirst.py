@@ -1,8 +1,14 @@
-"""Prepare HC3/MAGE with one shared UniRST segmentation and four inventories.
+"""Prepare HC3, MAGE, and Human Detectors with shared UniRST segmentation.
 
 Example:
     python 0_prepare_and_parse_datasets_unirst.py \
         --total-gpus 1 --gpu-id 0 --output-dir data/unirst
+
+Human Detectors only:
+    python 0_prepare_and_parse_datasets_unirst.py \
+        --skip-hc3 --skip-mage \
+        --human-detectors-path /path/to/human_detectors.json \
+        --output-dir data/unirst
 
 Run this script once per GPU for MAGE when using multiple GPUs.  Each worker
 owns a separate segmentation pickle and output shard.
@@ -12,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
 import re
 import tempfile
@@ -95,6 +102,103 @@ def mage_group(
             unit="document",
         )
     ]
+
+
+HUMAN_DETECTORS_LABELS = {
+    "human-written": 1,
+    "machine-generated": 0,
+}
+
+
+def human_detectors_group(
+    dataset_path: str,
+    splitter: SceneSplitter,
+    min_char_len: int,
+) -> List[Dict[str, Any]]:
+    """Load the released Human Detectors JSON as one held-out test group.
+
+    ``source`` retains the assigned generation model, prompt identity, and
+    original publisher.  Those fields are required to recover matched pairs
+    and to report generator- or publisher-specific results after parsing.
+    """
+    if os.path.isdir(dataset_path):
+        dataset_path = os.path.join(dataset_path, "human_detectors.json")
+    if not os.path.isfile(dataset_path):
+        raise FileNotFoundError(
+            "Human Detectors JSON not found at "
+            f"{dataset_path!r}; pass the released human_detectors.json file "
+            "or its repository directory to --human-detectors-path"
+        )
+
+    with open(dataset_path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if isinstance(payload, Mapping):
+        keyed_records = list(payload.items())
+    elif isinstance(payload, list):
+        keyed_records = [(str(index), record) for index, record in enumerate(payload)]
+    else:
+        raise ValueError(
+            "Human Detectors data must be a JSON object or a list of records"
+        )
+
+    def record_sort_key(item: Any) -> Any:
+        key, record = item
+        record_id = record.get("id", key) if isinstance(record, Mapping) else key
+        try:
+            return (0, int(record_id))
+        except (TypeError, ValueError):
+            return (1, str(record_id))
+
+    documents: List[Dict[str, Any]] = []
+    seen_record_ids = set()
+    for key, record in tqdm(
+        sorted(keyed_records, key=record_sort_key),
+        desc="preparing Human Detectors",
+        unit="document",
+    ):
+        if not isinstance(record, Mapping):
+            raise ValueError(f"Human Detectors record {key!r} is not an object")
+
+        record_id = str(record.get("id", key))
+        if record_id in seen_record_ids:
+            raise ValueError(f"duplicate Human Detectors record id {record_id!r}")
+        seen_record_ids.add(record_id)
+
+        raw_label = str(record.get("ground_truth", "")).strip()
+        label = HUMAN_DETECTORS_LABELS.get(raw_label.casefold())
+        if label is None:
+            raise ValueError(
+                f"Human Detectors record {record_id!r} has unknown "
+                f"ground_truth {raw_label!r}"
+            )
+        article = record.get("article")
+        if not isinstance(article, str):
+            raise ValueError(
+                f"Human Detectors record {record_id!r} has no string article"
+            )
+        article = article.strip()
+        if len(article) < min_char_len:
+            continue
+
+        generation_model = safe_name(str(record.get("generation_model", "unknown")))
+        prompt_id = safe_name(str(record.get("prompt_id", record_id)))
+        publisher = safe_name(str(record.get("source", "unknown")))
+        source = (
+            f"human_detectors::{generation_model}::"
+            f"prompt-{prompt_id}::{publisher}"
+        )
+        documents.append(
+            make_document_spec(
+                dataset="human_detectors",
+                split="test",
+                document_index=len(documents),
+                text=article,
+                source=source,
+                label=label,
+                scenes=splitter.split(article),
+            )
+        )
+    return documents
 
 
 def make_document_spec(
@@ -504,6 +608,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segments-dir", default=None)
     parser.add_argument("--hc3-dataset", default="Hello-SimpleAI/HC3")
     parser.add_argument("--mage-dataset", default="yaful/MAGE")
+    parser.add_argument(
+        "--human-detectors-path",
+        "--hd-path",
+        default=None,
+        help=(
+            "Path to the released human_detectors.json file or its repository "
+            "directory; omitted by default"
+        ),
+    )
     parser.add_argument("--min-char-len", type=int, default=10)
     parser.add_argument("--segment-relinventory", default="deu.rst.pcc")
     parser.add_argument("--relinventories", nargs="+", default=list(DEFAULT_REL_INVENTORIES))
@@ -547,6 +660,25 @@ def main() -> None:
                 args.output_mode,
                 args.force_parsing,
             )
+
+    # Human Detectors is a small, unsharded held-out collection.  As with HC3,
+    # restricting it to worker 0 prevents duplicate model work and cache writes
+    # during a multi-GPU MAGE launch.
+    if args.human_detectors_path is not None and args.gpu_id == 0:
+        documents = human_detectors_group(
+            args.human_detectors_path, splitter, args.min_char_len
+        )
+        run_group(
+            documents,
+            adapter,
+            segments_dir,
+            args.output_dir,
+            "human_detectors_test",
+            "human_detectors_test",
+            args.force_segmentation,
+            args.output_mode,
+            args.force_parsing,
+        )
 
     if not args.skip_mage:
         raw_mage = load_dataset(args.mage_dataset)
