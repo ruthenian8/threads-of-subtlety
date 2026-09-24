@@ -3,9 +3,11 @@ datasets<4.0.0
 evaluate
 isanlp_rst @ git+https://github.com/tchewik/isanlp_rst.git@master
 isanlp @ git+https://github.com/iinemo/isanlp.git
+matplotlib
 pydantic
 rich
 scikit-learn
+xgboost==2.1.1
 sentsplit
 tqdm
 torch

@@ -12,7 +12,7 @@ from tos.tos_dataset import Document, SceneDiscourseTree, ToSDataset
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
-    / "5_add_motif_dists_to_unirst_datasets.py"
+    / "scripts/prepare/add_motif_distributions.py"
 )
 SPEC = importlib.util.spec_from_file_location(
     "add_unirst_motif_distributions", SCRIPT_PATH

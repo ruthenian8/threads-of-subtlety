@@ -6,7 +6,7 @@ from glob import glob
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from itertools import combinations
+from itertools import combinations, permutations
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import networkx as nx
@@ -76,6 +76,7 @@ class MotifCatalogIndex:
     motifs: List[MotifMetadata]
     hash_buckets: Dict[str, List[int]]
     automorphism_counts: Tuple[int, ...]
+    canonical_m3: Optional[Dict[Tuple[str, ...], int]] = None
 
 
 @dataclass
@@ -573,6 +574,7 @@ class ToSDataset:
         motifs = ToSDataset.prepare_motif_metadata(graph_motifs)
         hash_buckets: Dict[str, List[int]] = defaultdict(list)
         automorphism_counts = []
+        canonical_m3 = {} if all(motif.node_count == 3 for motif in motifs) else None
         edge_match = lambda left, right: left["label_0"] == right["label_0"]
         for index, metadata in enumerate(motifs):
             motif_hash = nx.weisfeiler_lehman_graph_hash(
@@ -587,16 +589,42 @@ class ToSDataset:
             automorphism_counts.append(
                 sum(1 for _ in matcher.isomorphisms_iter())
             )
+            if canonical_m3 is not None:
+                canonical_m3[
+                    ToSDataset._canonical_m3_signature(metadata.graph)
+                ] = index
         return MotifCatalogIndex(
             motifs=motifs,
             hash_buckets=dict(hash_buckets),
             automorphism_counts=tuple(automorphism_counts),
+            canonical_m3=canonical_m3,
+        )
+
+    @staticmethod
+    def _canonical_m3_signature(graph: nx.DiGraph) -> Tuple[str, ...]:
+        """Return an exact isomorphism key for an edge-labeled triad."""
+        nodes = tuple(graph)
+        if len(nodes) != 3:
+            raise ValueError("Canonical M3 signatures require three nodes")
+        return min(
+            tuple(
+                "\x00"
+                if graph.get_edge_data(source, target) is None
+                else "\x01" + str(graph[source][target]["label_0"])
+                for source in ordered_nodes
+                for target in ordered_nodes
+            )
+            for ordered_nodes in permutations(nodes)
         )
 
     @staticmethod
     def _indexed_motif_match(
         candidate: nx.DiGraph, catalog: MotifCatalogIndex
     ) -> Optional[int]:
+        if catalog.canonical_m3 is not None and candidate.number_of_nodes() == 3:
+            return catalog.canonical_m3.get(
+                ToSDataset._canonical_m3_signature(candidate)
+            )
         motif_hash = nx.weisfeiler_lehman_graph_hash(
             candidate, edge_attr="label_0"
         )
@@ -634,19 +662,23 @@ class ToSDataset:
         motif_catalogs: Dict[str, MotifCatalogIndex],
         root_label: str,
     ) -> Dict[str, Dict[str, np.ndarray]]:
-        """Calculate exact M3/M6 distributions from observed occurrences.
+        """Calculate exact M3, or M3+M6, distributions from occurrences.
 
         The reference implementation tries every catalog motif against the
         scene.  Here each induced occurrence is enumerated once and resolved
         through a WL-hash bucket plus exact isomorphism.  Automorphism counts
         preserve GraphMatcher's mapping-count semantics.
         """
-        if set(motif_catalogs) != {"m3", "m6"}:
-            raise ValueError("Occurrence-driven calculation requires m3 and m6")
+        group_names = set(motif_catalogs)
+        if group_names not in ({"m3"}, {"m3", "m6"}):
+            raise ValueError(
+                "Occurrence-driven calculation requires m3 or m3+m6"
+            )
         m3_catalog = motif_catalogs["m3"]
-        m6_catalog = motif_catalogs["m6"]
-        if any(motif.node_count != 3 for motif in m3_catalog.motifs) or any(
-            motif.node_count != 5 for motif in m6_catalog.motifs
+        m6_catalog = motif_catalogs.get("m6")
+        if any(motif.node_count != 3 for motif in m3_catalog.motifs) or (
+            m6_catalog is not None
+            and any(motif.node_count != 5 for motif in m6_catalog.motifs)
         ):
             raise ValueError("Occurrence-driven catalogs must contain M3/M6 graphs")
 
@@ -660,12 +692,13 @@ class ToSDataset:
             for name, catalog in motif_catalogs.items()
         }
 
-        occurrences_by_node = defaultdict(list)
+        occurrences_by_node = defaultdict(list) if m6_catalog is not None else None
         for candidate in connected_three_node_subgraphs(G):
             nodes = frozenset(candidate)
-            occurrence = (nodes, candidate)
-            for node in nodes:
-                occurrences_by_node[node].append(occurrence)
+            if occurrences_by_node is not None:
+                occurrence = (nodes, candidate)
+                for node in nodes:
+                    occurrences_by_node[node].append(occurrence)
 
             motif_index = ToSDataset._indexed_motif_match(candidate, m3_catalog)
             if motif_index is None:
@@ -677,35 +710,36 @@ class ToSDataset:
             histograms["m3"][motif_index] += multiplicity
             depth_totals["m3"][motif_index] += multiplicity * mean_depth
 
-        seen_five_node_sets = set()
-        for shared_occurrences in occurrences_by_node.values():
-            for (left_nodes, _), (right_nodes, _) in combinations(
-                shared_occurrences, 2
-            ):
-                if len(left_nodes & right_nodes) != 1:
-                    continue
-                nodes = left_nodes | right_nodes
-                if nodes in seen_five_node_sets:
-                    continue
-                seen_five_node_sets.add(nodes)
-                candidate = G.subgraph(nodes).copy()
-                motif_index = ToSDataset._indexed_motif_match(
-                    candidate, m6_catalog
-                )
-                if motif_index is None:
-                    continue
-                multiplicity = m6_catalog.automorphism_counts[motif_index]
-                mean_depth = np.mean(
-                    [context.root_distances[node] for node in nodes]
-                )
-                histograms["m6"][motif_index] += multiplicity
-                depth_totals["m6"][motif_index] += multiplicity * mean_depth
+        if m6_catalog is not None:
+            seen_five_node_sets = set()
+            for shared_occurrences in occurrences_by_node.values():
+                for (left_nodes, _), (right_nodes, _) in combinations(
+                    shared_occurrences, 2
+                ):
+                    if len(left_nodes & right_nodes) != 1:
+                        continue
+                    nodes = left_nodes | right_nodes
+                    if nodes in seen_five_node_sets:
+                        continue
+                    seen_five_node_sets.add(nodes)
+                    candidate = G.subgraph(nodes).copy()
+                    motif_index = ToSDataset._indexed_motif_match(
+                        candidate, m6_catalog
+                    )
+                    if motif_index is None:
+                        continue
+                    multiplicity = m6_catalog.automorphism_counts[motif_index]
+                    mean_depth = np.mean(
+                        [context.root_distances[node] for node in nodes]
+                    )
+                    histograms["m6"][motif_index] += multiplicity
+                    depth_totals["m6"][motif_index] += multiplicity * mean_depth
 
         return {
             name: ToSDataset._finalize_observed_distribution(
                 histograms[name], depth_totals[name], context.diameter
             )
-            for name in ("m3", "m6")
+            for name in motif_catalogs
         }
 
     @staticmethod

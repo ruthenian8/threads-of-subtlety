@@ -337,8 +337,9 @@ def validate_selected_motif_hashes(
         raise ValueError(
             "Selected motif hashes do not match the motif files ("
             f"{details}). Regenerate the selection manifest with "
-            "3_extract_double_triads.py for M3+M6 (or "
-            "4_extract_triple_triads.py when M9 is required), or pass "
+            "archive/code/side_studies/3_extract_double_triads.py for M3+M6 "
+            "(or archive/code/side_studies/4_extract_triple_triads.py when M9 "
+            "is required), or pass "
             "--selected-hashes with a matching manifest."
         )
 
