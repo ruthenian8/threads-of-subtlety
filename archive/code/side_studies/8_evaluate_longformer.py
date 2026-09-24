@@ -111,7 +111,7 @@ def evaluate_longformer(
 
     data_loader = DataLoader(
         IndexedDataset(test_dataset),
-        batch_size=32,
+        batch_size=16,
         collate_fn=_indexed_collator(
             LongformerDataCollator(
                 tokenizer=tokenizer, padding="longest", add_motif=add_motif

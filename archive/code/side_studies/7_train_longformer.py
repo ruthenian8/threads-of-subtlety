@@ -68,10 +68,10 @@ def train_longformer_plain(
         load_best_model_at_end=True,
         logging_dir=f"./models/{model_name}",  # directory for storing logs
         logging_strategy="steps",
-        num_train_epochs=4,  # total number of training epochs
+        num_train_epochs=1,  # total number of training epochs
         output_dir=f"./results/{model_name}",  # output directory
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=32,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
         remove_unused_columns=False,
         save_total_limit=3,
         weight_decay=4e-5,
