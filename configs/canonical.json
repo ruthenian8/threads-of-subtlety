@@ -1,0 +1,38 @@
+{
+  "inventories": [
+    "deu.rst.pcc",
+    "eng.erst.gum.new",
+    "eng.rst.rstdt.new",
+    "nld.rst.nldt"
+  ],
+  "paths": {
+    "data_root": "data/unirst2/shared_segmentation",
+    "motif_root": "data/motifs2/shared_segmentation",
+    "raw_feature_root": "artifacts/work/shared_segmentation_raw_feature_matrices",
+    "artifact_root": "artifacts/canonical",
+    "rstdt_mapping": "docs/eng.rst.rstdt.new_to_coarse.json"
+  },
+  "settings": {
+    "model_seed": 42,
+    "bootstrap_seed": 20260909,
+    "domain_seed": 20260912,
+    "distribution_seed": 20240910,
+    "bootstrap_iterations": 2000,
+    "bootstrap_batch_size": 250,
+    "n_jobs": 4,
+    "figure_dpi": 180
+  },
+  "expected": {
+    "rows": {
+      "train": 43322,
+      "validation": 968,
+      "test": 1932
+    },
+    "model_summary_rows": 40,
+    "paired_summary_rows": 280,
+    "stability_rows": 144,
+    "robustness_model_rows": 200,
+    "rf_granularity_rows": 40,
+    "lr_wad_granularity_rows": 80
+  }
+}
