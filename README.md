@@ -13,10 +13,26 @@ NLDT define the segmentation target; the eRST and RST-DT inputs match every
 recoverable target scene exactly. OOD and Human Detectors analyses are archived
 side studies and are not included in the reported outcomes.
 
+## Start here
+
+- For the research questions and headline results, read the
+  [research report](UNIRST2_RESEARCH_REPORT.md) and
+  [paper-facing tables](PAPER_RELEVANT_RESULTS_TABLES.md).
+- For a guided repository map, data availability, and common tasks, see the
+  [collaborator's guide](docs/REPOSITORY_GUIDE.md).
+- For the canonical workflow, stage dependencies, and verification contract,
+  see the [pipeline guide](docs/UNIRST2_PIPELINE.md).
+- For the rationale and executed repository migration, see the
+  [refactor record](REPOSITORY_REFACTOR_PLAN.md); for inactive code and
+  exploratory work, see the [archive index](archive/README.md).
+- For exact run settings and paths, inspect
+  [`configs/canonical.json`](configs/canonical.json).
+
 ## Canonical run
 
-Create the environment from `requirements.txt`, restore `data/unirst2` and
-`data/motifs2`, then run:
+Install the dependencies from `requirements.txt` and restore the input bundles
+described in the [collaborator's guide](docs/REPOSITORY_GUIDE.md). The data and
+full generated run directory are intentionally not tracked in Git. Then run:
 
 ```bash
 python run_canonical.py resume --config configs/canonical.json
@@ -55,13 +71,20 @@ artifacts/work/              regenerable intermediate matrices and caches
 archive/                     obsolete code, side studies, and their artifacts
 ```
 
+The `data/` and `artifacts/` paths above describe the expected local working
+layout, not files included in a fresh clone. Git tracks the selected figures in
+`docs/figures/`, the pooled-frequency table in `docs/tables/`, and the reports;
+raw data, full run outputs, and archived generated artifacts are ignored.
+
 The canonical configuration resolves inputs through
 `data/unirst2/shared_segmentation` and `data/motifs2/shared_segmentation`.
 These views select the verified shared-segmentation eRST/RST-DT records while
 retaining the established PCC/NLDT records and catalogs.
 
-The active workflow does not read from `archive/`. Its contents are indexed by
-`archive/manifest.json`; each entry includes its size and SHA-256 digest.
+The active workflow does not read from `archive/`. Archived source code and
+small documents are tracked; generated archive artifacts and
+`archive/manifest.json` are local-only. Generate the local archive index with
+`python -m scripts.archive_manifest` after restoring or changing archive files.
 
 ## Input preparation
 
@@ -91,9 +114,12 @@ The main human-readable outputs are:
 - `docs/figures/relation_frequencies/` tracked pooled relation-frequency histograms
 - `docs/tables/overall_relation_frequencies.csv` pooled counts and edge shares
 
-Every canonical stage writes provenance alongside its outputs. The root
-`artifacts/canonical/manifest.json` records the configuration, environment,
-headline dimensions, sizes, and hashes used by `run_canonical.py verify`.
+The first two reports and the selected `docs/figures/` snapshots are tracked.
+`artifacts/canonical/` is generated locally; its `manifest.json` records the
+configuration, environment, headline dimensions, sizes, and hashes used by
+`run_canonical.py verify`.
+
+Every canonical stage writes provenance alongside its local outputs.
 
 ## Qualitative review
 

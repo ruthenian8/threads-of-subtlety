@@ -7,6 +7,11 @@ same HC3 identities. It uses M3 motifs and reports only the matched in-HC3
 experiment. Archived external-evaluation and detector branches do not feed the
 pipeline or its reports.
 
+For the human-readable findings, see the [research report](../UNIRST2_RESEARCH_REPORT.md)
+and [paper-facing tables](../PAPER_RELEVANT_RESULTS_TABLES.md). For repository
+navigation and the distinction between tracked snapshots and local-only data,
+see the [repository guide](REPOSITORY_GUIDE.md).
+
 ## Flow
 
 ```mermaid
@@ -125,7 +130,8 @@ bundles are preserved under `archive/artifacts/exploratory`.
 
 ## Archive boundary
 
-Active code and reports never read from `archive/`. `archive/manifest.json`
-records the size and digest of every archived file. See
-`REPOSITORY_REFACTOR_PLAN.md` and `archive/README.md` for the migration and
-restoration rules.
+Active code and reports never read from `archive/`. The optional
+`archive/manifest.json` is an ignored, local-only inventory of files present in
+the current working copy; it is not checked in and is not a data-restoration
+manifest. See `REPOSITORY_REFACTOR_PLAN.md` and `archive/README.md` for the
+repository boundary and archive policy.
