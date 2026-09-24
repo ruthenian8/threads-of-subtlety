@@ -165,7 +165,32 @@ data/hc3/
 data/mage/
 # Reproducible UniRST parses, graphs, split corpora, and inventory catalogs.
 data/unirst/
+data/unirst2/
+data/original_coarse_hf/
 data/motifs/*/
+data/motifs2/
+artifacts/unirst2_feature_matrices/
+artifacts/unirst2_model_comparison/
+artifacts/unirst2_paired_comparison/
+artifacts/unirst2_motif_associations/
+artifacts/unirst2_robustness/
+artifacts/unirst2_cross_standard_mapping/
+artifacts/unirst2_visuals/
+artifacts/unirst2_coarse_comparison/
+artifacts/unirst2_granularity_ablation/
+artifacts/unirst2_domain_distinctions/
+artifacts/unirst2_localized_ablation/
+artifacts/unirst2_ood_coarse_comparison/
+# Refactored active outputs and local research archive.
+artifacts/canonical/
+artifacts/work/
+artifacts/review/
+archive/artifacts/
+archive/exploratory/
+archive/manifest.json
+artifacts/old_seg_*/
+data/real-rstdt-dis
+data/rstdt-dis
 history.py
 longformer_dataset*.pkl
 results/
