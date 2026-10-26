@@ -4,6 +4,7 @@ evaluate
 isanlp_rst @ git+https://github.com/tchewik/isanlp_rst.git@master
 isanlp @ git+https://github.com/iinemo/isanlp.git
 matplotlib
+nltk>=3.6.3
 pydantic
 rich
 scikit-learn

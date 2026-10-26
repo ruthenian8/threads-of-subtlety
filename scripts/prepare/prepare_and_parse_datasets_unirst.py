@@ -2,7 +2,8 @@
 
 Example:
     python -m scripts.prepare.prepare_and_parse_datasets_unirst \
-        --total-gpus 1 --gpu-id 0 --output-dir data/unirst
+        --total-gpus 1 --gpu-id 0 --sentence-splitter punkt \
+        --output-dir data/unirst-punkt
 
 Human Detectors only:
     python -m scripts.prepare.prepare_and_parse_datasets_unirst \
@@ -84,24 +85,29 @@ def mage_group(
     total_gpus: int,
     gpu_id: int,
 ) -> List[Dict[str, Any]]:
-    chunks = list(split_list_into_n_chunks(range(len(raw_dataset[split])), total_gpus))
+    split_dataset = raw_dataset[split]
+    chunks = list(split_list_into_n_chunks(range(len(split_dataset)), total_gpus))
     target_indices = chunks[gpu_id]
-    return [
-        make_document_spec(
-            dataset="mage",
-            split=split,
-            document_index=doc_idx,
-            text=raw_dataset[split][doc_idx]["text"],
-            source=raw_dataset[split][doc_idx]["src"],
-            label=raw_dataset[split][doc_idx]["label"],
-            scenes=splitter.split(raw_dataset[split][doc_idx]["text"]),
+    documents = []
+    for doc_idx in tqdm(
+        target_indices,
+        desc=f"preparing MAGE {split} (GPU {gpu_id})",
+        unit="document",
+    ):
+        row = split_dataset[doc_idx]
+        text = row["text"]
+        documents.append(
+            make_document_spec(
+                dataset="mage",
+                split=split,
+                document_index=doc_idx,
+                text=text,
+                source=row["src"],
+                label=row["label"],
+                scenes=splitter.split(text),
+            )
         )
-        for doc_idx in tqdm(
-            target_indices,
-            desc=f"preparing MAGE {split} (GPU {gpu_id})",
-            unit="document",
-        )
-    ]
+    return documents
 
 
 HUMAN_DETECTORS_LABELS = {
@@ -618,6 +624,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--min-char-len", type=int, default=10)
+    parser.add_argument(
+        "--sentence-splitter",
+        choices=("punkt", "sentsplit"),
+        default="punkt",
+        help=(
+            "Sentence-boundary backend for overlong paragraphs. Use a new "
+            "output directory when changing it, because existing output "
+            "files are otherwise skipped."
+        ),
+    )
     parser.add_argument("--segment-relinventory", default="deu.rst.pcc")
     parser.add_argument("--relinventories", nargs="+", default=list(DEFAULT_REL_INVENTORIES))
     parser.add_argument("--hf-model-name", default="tchewik/isanlp_rst_v3")
@@ -635,7 +651,7 @@ def main() -> None:
     if args.gpu_id < 0 or args.gpu_id >= args.total_gpus:
         raise ValueError("--gpu-id must be in [0, --total-gpus)")
     segments_dir = args.segments_dir or os.path.join(args.output_dir, "segments-deu.rst.pcc")
-    splitter = SceneSplitter()
+    splitter = SceneSplitter(sentence_splitter=args.sentence_splitter)
     adapter = UniRSTAdapter(
         segment_relinventory=args.segment_relinventory,
         relation_inventories=args.relinventories,

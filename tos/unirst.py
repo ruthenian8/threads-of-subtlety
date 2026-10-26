@@ -17,7 +17,6 @@ import re
 import tempfile
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
-from sentsplit.segment import SentSplit
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
@@ -32,18 +31,97 @@ DEFAULT_REL_INVENTORIES = (
     "nld.rst.nldt",
 )
 
-SEGMENTATION_CHECKPOINT_INTERVAL = 100
+SEGMENTATION_CHECKPOINT_INTERVAL = 1000
 
 
 class SceneSplitter:
     """Split documents at the parser token limit for every UniRST workflow."""
 
-    def __init__(self, max_tokens_margin: int = 20):
+    def __init__(
+        self, max_tokens_margin: int = 20, sentence_splitter: str = "punkt"
+    ):
         self.tokenizer = AutoTokenizer.from_pretrained(
             "xlm-roberta-base", use_fast=True
         )
         self.max_tokens = self.tokenizer.model_max_length - max_tokens_margin
-        self.sent_splitter = SentSplit("en")
+        self.sentence_splitter = sentence_splitter
+        if sentence_splitter == "punkt":
+            from nltk import data as nltk_data
+            from nltk import tokenize as nltk_tokenize
+
+            punkt_tokenizer = getattr(nltk_tokenize, "PunktTokenizer", None)
+            try:
+                self.sent_splitter = (
+                    punkt_tokenizer("english")
+                    if punkt_tokenizer is not None
+                    else nltk_data.load("tokenizers/punkt/english.pickle")
+                )
+            except LookupError as exc:
+                resource = "punkt_tab" if punkt_tokenizer is not None else "punkt"
+                raise LookupError(
+                    "English Punkt data is missing. Install it with "
+                    f"'python -m nltk.downloader {resource}'."
+                ) from exc
+        elif sentence_splitter == "sentsplit":
+            from sentsplit.segment import SentSplit
+
+            self.sent_splitter = SentSplit("en")
+        else:
+            raise ValueError(
+                "sentence_splitter must be 'punkt' or 'sentsplit'"
+            )
+
+    def _token_count(self, text: str) -> int:
+        return len(self.tokenizer.tokenize(text))
+
+    def _sentences(self, paragraph: str) -> List[str]:
+        if self.sentence_splitter == "sentsplit":
+            return self.sent_splitter.segment(paragraph, strip_spaces=False)
+        spans = list(self.sent_splitter.span_tokenize(paragraph))
+        if not spans:
+            return [paragraph]
+        starts = [0] + [start for start, _ in spans[1:]]
+        if any(left >= right for left, right in zip(starts, starts[1:])):
+            raise ValueError("Punkt returned non-increasing sentence offsets")
+        starts.append(len(paragraph))
+        return [
+            paragraph[start:end]
+            for start, end in zip(starts, starts[1:])
+            if start < end
+        ]
+
+    def _bounded_sentence_chunks(self, sentence: str) -> List[str]:
+        """Preserve every character while enforcing the parser's token cap."""
+        chunks = []
+        remaining = sentence
+        while self._token_count(remaining) > self.max_tokens:
+            low, high = 1, len(remaining)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if self._token_count(remaining[:middle]) <= self.max_tokens:
+                    low = middle
+                else:
+                    high = middle - 1
+            cutoff = low
+            while cutoff > 1 and self._token_count(remaining[:cutoff]) > self.max_tokens:
+                cutoff //= 2
+            if self._token_count(remaining[:cutoff]) > self.max_tokens:
+                raise ValueError("Could not fit a character within the scene token limit")
+            whitespace_cutoff = max(
+                remaining.rfind(char, 0, cutoff) + 1 for char in (" ", "\t", "\n")
+            )
+            if (
+                whitespace_cutoff > 0
+                and whitespace_cutoff >= max(1, cutoff // 2)
+                and self._token_count(remaining[:whitespace_cutoff])
+                <= self.max_tokens
+            ):
+                cutoff = whitespace_cutoff
+            chunks.append(remaining[:cutoff])
+            remaining = remaining[cutoff:]
+        if remaining:
+            chunks.append(remaining)
+        return chunks
 
     def split(self, document: str) -> List[str]:
         paragraphs = document.split("\n\n")
@@ -52,19 +130,27 @@ class SceneSplitter:
         current_token_count = 0
 
         for paragraph in paragraphs:
-            token_count = len(self.tokenizer.tokenize(paragraph))
+            token_count = self._token_count(paragraph)
             if token_count > self.max_tokens:
-                sentences = self.sent_splitter.segment(paragraph, strip_spaces=False)
+                sentences = self._sentences(paragraph)
                 for sentence in sentences:
-                    token_count = len(self.tokenizer.tokenize(sentence))
-                    if current_token_count + token_count > self.max_tokens:
-                        if current_scene.strip():
-                            scenes.append(current_scene.strip())
-                        current_scene = sentence
-                        current_token_count = token_count
+                    sentence_tokens = self._token_count(sentence)
+                    if sentence_tokens > self.max_tokens:
+                        chunks = [
+                            (chunk, self._token_count(chunk))
+                            for chunk in self._bounded_sentence_chunks(sentence)
+                        ]
                     else:
-                        current_scene += sentence
-                        current_token_count += token_count
+                        chunks = [(sentence, sentence_tokens)]
+                    for chunk, token_count in chunks:
+                        if current_token_count + token_count > self.max_tokens:
+                            if current_scene.strip():
+                                scenes.append(current_scene.strip())
+                            current_scene = chunk
+                            current_token_count = token_count
+                        else:
+                            current_scene += chunk
+                            current_token_count += token_count
                 if current_scene.strip():
                     scenes.append(current_scene.strip())
                 current_scene = ""
