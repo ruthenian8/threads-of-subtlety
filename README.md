@@ -169,3 +169,32 @@ python 0_prepare_and_parse_datasets_unirst.py \
 
 HC3 and MAGE loading, scene splitting, and downstream graph/motif formats are
 kept compatible with the original pipeline.
+
+### StoryScope stories
+
+The optional [StoryScope](https://huggingface.co/datasets/jjrussell10/storyscope)
+input uses its released train, validation, test, and dev splits. Each story
+in story_gpt, story_deepseek, story_kimi, story_gemini, or story_claude that
+meets --min-char-len (10 characters by default) becomes a **separate**
+machine-labeled document. Its source records both the model column and
+prompt_id, so generations from one prompt can still be matched. The release
+does not include the human story text; it cannot by itself supply
+human-labeled examples for an authorship test.
+
+To parse just the StoryScope test split with all requested RST inventories:
+
+    python 0_prepare_and_parse_datasets_unirst.py \
+      --skip-hc3 --skip-mage \
+      --storyscope-dataset jjrussell10/storyscope \
+      --storyscope-splits test --output-dir data/unirst
+
+Omit --storyscope-splits to process all four released splits. The loader reads
+only the requested split at a time. As with MAGE, use --total-gpus N
+--gpu-id K for disjoint prompt shards. StoryScope is additionally processed
+in batches of 100 prompts by default; --storyscope-batch-prompts changes that
+bound. For example, the test command above writes files like
+storyscope_test_gpu0_batch0000_machine.discourse_parsed.jsonl under each rel-*
+directory, plus paired files when the default output mode is used. The graph
+stage discovers these parsed files automatically; motif extraction and
+distribution stages can select them with --dataset-name storyscope after a
+StoryScope catalog has been prepared.

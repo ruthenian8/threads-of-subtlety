@@ -1,4 +1,4 @@
-"""Prepare HC3, MAGE, and Human Detectors with shared UniRST segmentation.
+"""Prepare HC3, MAGE, Human Detectors, and StoryScope with shared UniRST segmentation.
 
 Example:
     python 0_prepare_and_parse_datasets_unirst.py \
@@ -10,8 +10,14 @@ Human Detectors only:
         --human-detectors-path /path/to/human_detectors.json \
         --output-dir data/unirst
 
-Run this script once per GPU for MAGE when using multiple GPUs.  Each worker
-owns a separate segmentation pickle and output shard.
+StoryScope test only (one record per nonempty model story):
+    python 0_prepare_and_parse_datasets_unirst.py \
+        --skip-hc3 --skip-mage \
+        --storyscope-dataset jjrussell10/storyscope \
+        --storyscope-splits test --output-dir data/unirst
+
+Run this script once per GPU for MAGE or StoryScope when using multiple GPUs.
+Each worker owns a separate segmentation pickle and output shard.
 """
 
 from __future__ import annotations
@@ -102,6 +108,80 @@ def mage_group(
             unit="document",
         )
     ]
+
+
+STORYSCOPE_MODEL_COLUMNS = (
+    ("story_gpt", "gpt"),
+    ("story_deepseek", "deepseek"),
+    ("story_kimi", "kimi"),
+    ("story_gemini", "gemini"),
+    ("story_claude", "claude"),
+)
+STORYSCOPE_SPLITS = ("train", "validation", "test", "dev")
+
+
+def storyscope_group(
+    raw_dataset: Any,
+    split: str,
+    splitter: SceneSplitter,
+    total_gpus: int,
+    gpu_id: int,
+    min_char_len: int,
+    prompt_indices: Optional[Sequence[int]] = None,
+) -> List[Dict[str, Any]]:
+    """Turn each nonempty model column into its own machine-labeled document.
+
+    The released StoryScope split files contain AI stories but not human story
+    text. Model and prompt identity are retained in the source field so paired
+    generations remain distinguishable downstream.
+    """
+    split_dataset = raw_dataset[split]
+    columns = getattr(split_dataset, "column_names", None)
+    if columns is not None:
+        missing = [column for column, _ in STORYSCOPE_MODEL_COLUMNS if column not in columns]
+        if missing:
+            raise ValueError(f"StoryScope {split} is missing story columns: {missing}")
+    if prompt_indices is None:
+        chunks = list(split_list_into_n_chunks(range(len(split_dataset)), total_gpus))
+        target_indices = chunks[gpu_id]
+    else:
+        target_indices = prompt_indices
+    documents: List[Dict[str, Any]] = []
+    for row_index in tqdm(
+        target_indices,
+        desc=f"preparing StoryScope {split} (GPU {gpu_id})",
+        unit="prompt",
+    ):
+        row = split_dataset[row_index]
+        prompt_id = row.get("prompt_id", row_index)
+        if prompt_id is None:
+            prompt_id = row_index
+        source_prompt = safe_name(str(prompt_id))
+        for column, model in STORYSCOPE_MODEL_COLUMNS:
+            if column not in row:
+                raise ValueError(f"StoryScope {split} row {row_index} is missing {column}")
+            story = row[column]
+            if not isinstance(story, str):
+                if story is None:
+                    continue
+                raise ValueError(
+                    f"StoryScope {split} row {row_index} has non-text {column}"
+                )
+            text = story.strip()
+            if len(text) < min_char_len:
+                continue
+            documents.append(
+                make_document_spec(
+                    dataset="storyscope",
+                    split=split,
+                    document_index=len(documents),
+                    text=text,
+                    source=f"storyscope::{model}::prompt-{source_prompt}",
+                    label=0,
+                    scenes=splitter.split(text),
+                )
+            )
+    return documents
 
 
 HUMAN_DETECTORS_LABELS = {
@@ -609,6 +689,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hc3-dataset", default="Hello-SimpleAI/HC3")
     parser.add_argument("--mage-dataset", default="yaful/MAGE")
     parser.add_argument(
+        "--storyscope-dataset",
+        default=None,
+        help="Optional Hugging Face StoryScope dataset, e.g. jjrussell10/storyscope.",
+    )
+    parser.add_argument(
+        "--storyscope-splits",
+        nargs="+",
+        choices=STORYSCOPE_SPLITS,
+        default=list(STORYSCOPE_SPLITS),
+        help="StoryScope splits to parse when --storyscope-dataset is set.",
+    )
+    parser.add_argument(
+        "--storyscope-batch-prompts",
+        type=int,
+        default=100,
+        help="Prompts per StoryScope output shard; bounds segmentation memory.",
+    )
+    parser.add_argument(
         "--human-detectors-path",
         "--hd-path",
         default=None,
@@ -634,6 +732,8 @@ def main() -> None:
     args = parse_args()
     if args.gpu_id < 0 or args.gpu_id >= args.total_gpus:
         raise ValueError("--gpu-id must be in [0, --total-gpus)")
+    if args.storyscope_batch_prompts < 1:
+        raise ValueError("--storyscope-batch-prompts must be at least 1")
     segments_dir = args.segments_dir or os.path.join(args.output_dir, "segments-deu.rst.pcc")
     splitter = SceneSplitter()
     adapter = UniRSTAdapter(
@@ -679,6 +779,38 @@ def main() -> None:
             args.output_mode,
             args.force_parsing,
         )
+
+    if args.storyscope_dataset is not None:
+        for split in args.storyscope_splits:
+            split_dataset = load_dataset(args.storyscope_dataset, split=split)
+            chunks = list(
+                split_list_into_n_chunks(
+                    range(len(split_dataset)), args.total_gpus
+                )
+            )
+            worker_indices = chunks[args.gpu_id]
+            for batch_index, start in enumerate(
+                range(0, len(worker_indices), args.storyscope_batch_prompts)
+            ):
+                indices = worker_indices[start : start + args.storyscope_batch_prompts]
+                documents = storyscope_group(
+                    {split: split_dataset}, split, splitter, args.total_gpus,
+                    args.gpu_id, args.min_char_len, prompt_indices=indices,
+                )
+                shard_name = (
+                    f"storyscope_{split}_gpu{args.gpu_id}_batch{batch_index:04d}"
+                )
+                run_group(
+                    documents,
+                    adapter,
+                    segments_dir,
+                    args.output_dir,
+                    shard_name,
+                    shard_name,
+                    args.force_segmentation,
+                    args.output_mode,
+                    args.force_parsing,
+                )
 
     if not args.skip_mage:
         raw_mage = load_dataset(args.mage_dataset)
