@@ -336,10 +336,14 @@ def parse_predictions(
         Callable[[str, Mapping[str, Mapping[str, Any]]], None]
     ] = None,
     inventories: Optional[Sequence[str]] = None,
+    batch_size: int = 1,
 ) -> Dict[str, Dict[str, Any]]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     predictions: Dict[str, Dict[str, Any]] = {
         scene["scene_key"]: {} for scene in scenes
     }
+    scene_positions = {scene["scene_key"]: index for index, scene in enumerate(scenes)}
     selected_inventories = (
         tuple(adapter.relation_inventories)
         if inventories is None
@@ -348,6 +352,9 @@ def parse_predictions(
     for relinventory in selected_inventories:
         parser = adapter.make_parser(relinventory)
         try:
+            if batch_size > 1 and not callable(getattr(parser, "from_edus_batch", None)):
+                raise RuntimeError("Installed UniRST parser does not support from_edus_batch")
+            batch_results = {}
             for scene in tqdm(
                 scenes,
                 desc=f"parsing {relinventory}",
@@ -363,7 +370,20 @@ def parse_predictions(
                     }
                     continue
                 try:
-                    result = parser.from_edus(scene["edus"])
+                    if batch_size > 1 and not batch_results:
+                        # A small buffer bounds memory while preserving scene order.
+                        start = scene_positions[scene["scene_key"]]
+                        batch = [s for s in scenes[start:start + batch_size] if s["status"] == "ok"]
+                        try:
+                            results = list(parser.from_edus_batch(
+                                [s["edus"] for s in batch], batch_size=batch_size
+                            ))
+                            if len(results) != len(batch):
+                                raise ValueError("UniRST returned an unexpected batch length")
+                            batch_results.update((s["scene_key"], r) for s, r in zip(batch, results))
+                        except Exception:
+                            pass
+                    result = batch_results.pop(scene["scene_key"]) if scene["scene_key"] in batch_results else parser.from_edus(scene["edus"])
                     parsed = adapter.to_constituency_format(result, len(scene["edus"]))
                     predictions[scene["scene_key"]][relinventory] = {
                         "status": "ok",
@@ -520,6 +540,7 @@ def run_group(
     force_segmentation: bool,
     output_mode: str,
     force_parsing: bool = False,
+    batch_size: int = 1,
 ) -> None:
     if not documents:
         return
@@ -590,6 +611,7 @@ def run_group(
         scenes,
         inventories=inventories_to_parse,
         on_inventory_complete=save_intermediate_outputs,
+        batch_size=batch_size,
     )
     if output_mode in {"paired", "both"}:
         # Paired artifacts are the final complete product and must not expose
@@ -641,6 +663,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-mode", choices=("separate", "paired", "both"), default="both")
     parser.add_argument("--force-segmentation", action="store_true")
     parser.add_argument("--force-parsing", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=1, help="UniRST parsing batch size (default: 1)")
     parser.add_argument("--skip-hc3", action="store_true")
     parser.add_argument("--skip-mage", action="store_true")
     return parser.parse_args()
@@ -648,6 +671,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be positive")
     if args.gpu_id < 0 or args.gpu_id >= args.total_gpus:
         raise ValueError("--gpu-id must be in [0, --total-gpus)")
     segments_dir = args.segments_dir or os.path.join(args.output_dir, "segments-deu.rst.pcc")
@@ -675,6 +700,7 @@ def main() -> None:
                 args.force_segmentation,
                 args.output_mode,
                 args.force_parsing,
+                args.batch_size,
             )
 
     # Human Detectors is a small, unsharded held-out collection.  As with HC3,
@@ -694,6 +720,7 @@ def main() -> None:
             args.force_segmentation,
             args.output_mode,
             args.force_parsing,
+            args.batch_size,
         )
 
     if not args.skip_mage:
@@ -712,6 +739,7 @@ def main() -> None:
                 args.force_segmentation,
                 args.output_mode,
                 args.force_parsing,
+                args.batch_size,
             )
 
 
