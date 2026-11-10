@@ -281,15 +281,13 @@ class UniRSTAdapter:
 
     @staticmethod
     def _segment_with_unirst_predictor(predictor: Any, text: str) -> List[str]:
-        """Run UniRST's learned EDU segmenter without decoding an RST tree.
+        return UniRSTAdapter._segment_batch_with_unirst_predictor(predictor, [text])[0]
 
-        ``isanlp_rst.parser.Parser`` currently has no public segmentation-only
-        method: ``Parser.__call__`` always runs ``parse_rst``.  This method
-        mirrors the tokenization and EDU alignment portions of ``parse_rst``,
-        but calls the model encoder directly and never invokes tree or relation
-        decoding.  Attribute checks make upstream API incompatibilities fail
-        explicitly instead of silently falling back to the expensive path.
-        """
+    @staticmethod
+    def _segment_batch_with_unirst_predictor(
+        predictor: Any, texts: Sequence[str]
+    ) -> List[List[str]]:
+        """Batch the segmentation encoder without tree or relation decoding."""
         try:
             import razdel
             import torch
@@ -309,87 +307,85 @@ class UniRSTAdapter:
                 "universal parser segmentation components expected by this adapter"
             )
 
-        razdel_tokens = list(razdel.tokenize(text))
-        word_tokens = [token.text for token in razdel_tokens]
-        word_offsets = [(token.start, token.stop) for token in razdel_tokens]
-        if not word_tokens:
-            raise ValueError("UniRST could not tokenize the scene")
-
-        # parse_rst() returns a single dummy EDU for fewer than three tokens
-        # without running the model.  Preserve that behavior here.
-        if len(word_tokens) < 3:
-            start, end = word_offsets[0][0], word_offsets[-1][1]
-            return [text[start:end]]
+        results: List[List[str]] = [[] for _ in texts]
+        pending = []
+        for index, text in enumerate(texts):
+            tokens = list(razdel.tokenize(text))
+            words = [token.text for token in tokens]
+            offsets = [(token.start, token.stop) for token in tokens]
+            if not words:
+                raise ValueError("UniRST could not tokenize the scene")
+            if len(words) < 3:
+                results[index] = [text[offsets[0][0]:offsets[-1][1]]]
+            else:
+                pending.append((index, text, words, offsets))
+        if not pending:
+            return results
 
         input_data = Data(
-            input_sentences=[word_tokens],
-            edu_breaks=[[]],
-            decoder_input=[[]],
-            relation_label=[[]],
-            parsing_breaks=[[]],
-            golden_metric=[[]],
+            input_sentences=[item[2] for item in pending],
+            edu_breaks=[[] for _ in pending],
+            decoder_input=[[] for _ in pending],
+            relation_label=[[] for _ in pending],
+            parsing_breaks=[[] for _ in pending],
+            golden_metric=[[] for _ in pending],
         )
         batch = tokenize(input_data)
-
         with torch.inference_mode():
             encoder_output = encoder(
-                batch.input_sentences,
-                batch.entity_ids,
-                batch.entity_position_ids,
-                batch.edu_breaks,
-                sent_breaks=batch.sent_breaks,
-                is_test=True,
-                dataset_index=batch.dataset_index,
+                batch.input_sentences, batch.entity_ids, batch.entity_position_ids,
+                batch.edu_breaks, sent_breaks=batch.sent_breaks,
+                is_test=True, dataset_index=batch.dataset_index,
             )
-
         if not isinstance(encoder_output, (tuple, list)) or len(encoder_output) < 4:
             raise RuntimeError("UniRST encoder did not return predicted EDU boundaries")
         predicted_batches = encoder_output[3]
-        if not predicted_batches or len(predicted_batches) != 1:
+        if len(predicted_batches) != len(pending):
             raise RuntimeError("UniRST returned an invalid segmentation batch")
+        for row, (index, text, word_tokens, word_offsets) in enumerate(pending):
+            input_ids = batch.input_sentences[row]
+            predicted_breaks = [int(index) for index in predicted_batches[row]]
+            if (
+                not predicted_breaks
+                or predicted_breaks[-1] != len(input_ids) - 1
+                or any(
+                    current <= previous
+                    for previous, current in zip(predicted_breaks, predicted_breaks[1:])
+                )
+                or predicted_breaks[0] < 0
+            ):
+                raise ValueError(
+                    "UniRST returned invalid or incomplete predicted EDU boundaries"
+                )
 
-        input_ids = batch.input_sentences[0]
-        predicted_breaks = [int(index) for index in predicted_batches[0]]
-        if (
-            not predicted_breaks
-            or predicted_breaks[-1] != len(input_ids) - 1
-            or any(
-                current <= previous
-                for previous, current in zip(predicted_breaks, predicted_breaks[1:])
+            # Recompute the fast-tokenizer offsets discarded by Predictor.tokenize
+            # and use them directly. This preserves word boundaries even when
+            # decoding subwords changes character counts (e.g. Unicode or <unk>).
+            normalized_text = " ".join(word_tokens).strip()
+            tokenized_with_offsets = tokenizer(
+                normalized_text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
             )
-            or predicted_breaks[0] < 0
-        ):
-            raise ValueError(
-                "UniRST returned invalid or incomplete predicted EDU boundaries"
+            offset_input_ids = tokenized_with_offsets["input_ids"]
+            if list(offset_input_ids) != list(input_ids):
+                raise RuntimeError(
+                    "UniRST tokenizer produced inconsistent IDs while recovering offsets"
+                )
+            word_boundaries = UniRSTAdapter._align_subword_breaks_to_words(
+                predicted_breaks,
+                tokenized_with_offsets["offset_mapping"],
+                word_tokens,
             )
-
-        # Recompute the fast-tokenizer offsets discarded by Predictor.tokenize
-        # and use them directly. This preserves word boundaries even when
-        # decoding subwords changes character counts (e.g. Unicode or <unk>).
-        normalized_text = " ".join(word_tokens).strip()
-        tokenized_with_offsets = tokenizer(
-            normalized_text,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-        )
-        offset_input_ids = tokenized_with_offsets["input_ids"]
-        if list(offset_input_ids) != list(input_ids):
-            raise RuntimeError(
-                "UniRST tokenizer produced inconsistent IDs while recovering offsets"
-            )
-        word_boundaries = UniRSTAdapter._align_subword_breaks_to_words(
-            predicted_breaks,
-            tokenized_with_offsets["offset_mapping"],
-            word_tokens,
-        )
-        edus: List[str] = []
-        start_token = 0
-        for end_token in word_boundaries:
-            start_character = word_offsets[start_token][0]
-            end_character = word_offsets[end_token - 1][1]
-            edus.append(text[start_character:end_character])
-            start_token = end_token
-        return edus
+            edus: List[str] = []
+            start_token = 0
+            for end_token in word_boundaries:
+                start_character = word_offsets[start_token][0]
+                end_character = word_offsets[end_token - 1][1]
+                edus.append(text[start_character:end_character])
+                start_token = end_token
+            results[index] = edus
+        return results
 
     def _segment_edus(self, text: str) -> List[str]:
         parser = self.segmenter()
@@ -463,6 +459,32 @@ class UniRSTAdapter:
             "status": "ok",
             "error": None,
         }
+
+    def segment_scenes(
+        self, texts: Sequence[str], batch_size: int = 8
+    ) -> List[Dict[str, Any]]:
+        """Segment bounded batches, retaining input order and original offsets."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if isinstance(texts, (str, bytes)):
+            raise TypeError("texts must be a sequence of scene strings")
+        if not texts:
+            return []
+        predictor = getattr(self.segmenter(), "predictor", None)
+        if batch_size == 1 or predictor is None:
+            return [self.segment_scene(text) for text in texts]
+        results = []
+        for start in range(0, len(texts), batch_size):
+            chunk = texts[start:start + batch_size]
+            for text, edus in zip(
+                chunk, self._segment_batch_with_unirst_predictor(predictor, chunk)
+            ):
+                edus = self._normalise_edus(edus)
+                results.append({
+                    "text": text, "edus": edus, **self._scene_token_metadata(edus),
+                    "status": "ok", "error": None,
+                })
+        return results
 
     @staticmethod
     def _normalise_nuclearity(value: Any) -> str:
@@ -617,6 +639,7 @@ def load_or_create_segmentation_cache(
     force: bool = False,
     progress_desc: Optional[str] = None,
     checkpoint_interval: int = SEGMENTATION_CHECKPOINT_INTERVAL,
+    batch_size: int = 1,
 ) -> List[Dict[str, Any]]:
     """Load a validated segmentation pickle or create it incrementally.
 
@@ -624,6 +647,8 @@ def load_or_create_segmentation_cache(
     interrupted run to resume without repeatedly serializing the full scene
     list for every scene.
     """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     if checkpoint_interval < 1:
         raise ValueError("checkpoint_interval must be positive")
     metadata = _cache_metadata(adapter, scene_specs)
@@ -648,9 +673,35 @@ def load_or_create_segmentation_cache(
         if progress_desc
         else remaining_specs
     )
+    batch_end = len(scenes)
+    batch_start = len(scenes)
+    batch_results = None
     for scene_index, spec in enumerate(specs, start=len(scenes) + 1):
+        if batch_size > 1 and scene_index > batch_end:
+            batch_start = scene_index - 1
+            # Stop prefetch at checkpoints so completed work is persisted promptly.
+            batch_end = min(
+                batch_start + batch_size, len(scene_specs),
+                (batch_start // checkpoint_interval + 1) * checkpoint_interval,
+            )
+            chunk = scene_specs[batch_start:batch_end]
+            try:
+                batch_results = adapter.segment_scenes(
+                    [item["text"] for item in chunk], batch_size=batch_size
+                )
+            except Exception as exc:
+                tqdm.write(
+                    f"batch segmentation failed ({type(exc).__name__}: {exc}); "
+                    f"retrying {len(chunk)} scenes individually"
+                )
+                batch_results = None
+            if batch_results is not None and len(batch_results) != len(chunk):
+                raise RuntimeError("UniRST returned an unexpected segmentation result count")
         try:
-            segmented = adapter.segment_scene(spec["text"])
+            segmented = (
+                adapter.segment_scene(spec["text"]) if batch_results is None
+                else batch_results[scene_index - 1 - batch_start]
+            )
         except Exception as exc:  # Persist failures so interrupted jobs are inspectable.
             segmented = {
                 "text": spec["text"],

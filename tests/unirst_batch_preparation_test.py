@@ -98,7 +98,7 @@ class BatchPreparationTest(unittest.TestCase):
 
     def test_run_group_forwards_batch_size(self):
         doc = preparation.make_document_spec("hc3", "train", 0, "a", "source", 1, ["a"])
-        with mock.patch.object(preparation, "load_or_create_segmentation_cache", return_value=[scene("a")]), \
+        with mock.patch.object(preparation, "load_or_create_segmentation_cache", return_value=[scene("a")]) as segment, \
              mock.patch.object(preparation, "parse_predictions", return_value={}) as parse, \
              mock.patch.object(preparation, "write_group_outputs"):
             preparation.run_group(
@@ -106,6 +106,7 @@ class BatchPreparationTest(unittest.TestCase):
                 "sample", "sample", False, "separate", batch_size=4,
             )
         self.assertEqual(parse.call_args.kwargs["batch_size"], 4)
+        self.assertEqual(segment.call_args.kwargs["batch_size"], 4)
 
     def test_cli_forwards_batch_size_for_all_dataset_routes(self):
         argv = ["prepare", "--batch-size", "4", "--human-detectors-path", "hd.json",

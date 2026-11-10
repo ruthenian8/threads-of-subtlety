@@ -666,6 +666,7 @@ def run_group(
         cache_path,
         force=force_segmentation,
         progress_desc=f"segmenting {prefix}",
+        batch_size=batch_size,
     )
     adapter.release_segmenter()
 
