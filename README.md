@@ -20,6 +20,20 @@ EDUs are persisted as validated pickle artifacts and reused through UniRST's
 `from_edus()` API. Consequently, all relation-inventory predictions use the
 same EDU boundaries.
 
+Optional batched inference uses the upstream
+[batched UniRST branch](https://github.com/ruthenian8/isanlp_rst/tree/experiment/batched-unirst),
+pinned in requirements.txt; this upstream version requires Python 3.10 or newer.
+Pass --batch-size 8 to the preparation command to
+parse up to eight scenes per from_edus_batch call while preserving cached EDU
+boundaries and result order. The default, --batch-size 1, uses from_edus.
+This applies to HC3, MAGE, Human Detectors, and StoryScope; it is independent
+of --storyscope-batch-prompts, which controls output shards. A failed batch
+is reported and retried individually so scene-specific errors are retained.
+An unavailable batch API or incorrect result count stops the run. Batch size
+affects memory use, and floating-point rounding may change borderline model
+predictions. Existing outputs remain skipped; use --force-parsing and a
+separate --output-dir when comparing batch sizes.
+
 The four relation inventories are:
 
 `eng.erst.gum`, `eng.rst.rstdt`, `deu.rst.pcc`, and `nld.rst.nldt`.

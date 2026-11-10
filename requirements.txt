@@ -1,7 +1,8 @@
 accelerate
 datasets<4.0.0
 evaluate
-isanlp_rst @ git+https://github.com/tchewik/isanlp_rst.git@master
+# Pinned experiment/batched-unirst revision with from_edus_batch support.
+isanlp_rst @ git+https://github.com/ruthenian8/isanlp_rst.git@c51480a10a6636ae621fcc4676b12c0099f7a0f9
 isanlp @ git+https://github.com/iinemo/isanlp.git
 pydantic
 rich

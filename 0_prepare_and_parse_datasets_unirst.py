@@ -410,7 +410,10 @@ def parse_predictions(
         Callable[[str, Mapping[str, Mapping[str, Any]]], None]
     ] = None,
     inventories: Optional[Sequence[str]] = None,
+    batch_size: int = 1,
 ) -> Dict[str, Dict[str, Any]]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     predictions: Dict[str, Dict[str, Any]] = {
         scene["scene_key"]: {} for scene in scenes
     }
@@ -422,34 +425,57 @@ def parse_predictions(
     for relinventory in selected_inventories:
         parser = adapter.make_parser(relinventory)
         try:
-            for scene in tqdm(
-                scenes,
+            if batch_size > 1 and not callable(getattr(parser, "from_edus_batch", None)):
+                raise RuntimeError(
+                    "Batched inference requires from_edus_batch(); install requirements.txt"
+                )
+            with tqdm(
                 desc=f"parsing {relinventory}",
                 unit="scene",
                 leave=False,
                 total=len(scenes),
-            ):
-                if scene["status"] != "ok":
-                    predictions[scene["scene_key"]][relinventory] = {
-                        "status": "segmentation_error",
-                        "parsed": "NONE",
-                        "error": scene["error"],
-                    }
-                    continue
-                try:
-                    result = parser.from_edus(scene["edus"])
-                    parsed = adapter.to_constituency_format(result, len(scene["edus"]))
-                    predictions[scene["scene_key"]][relinventory] = {
-                        "status": "ok",
-                        "parsed": parsed,
-                        "error": None,
-                    }
-                except Exception as exc:
-                    predictions[scene["scene_key"]][relinventory] = {
-                        "status": "error",
-                        "parsed": "NONE",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
+            ) as progress:
+                for start in range(0, len(scenes), batch_size):
+                    chunk = scenes[start : start + batch_size]
+                    valid = []
+                    for scene in chunk:
+                        if scene["status"] == "ok":
+                            valid.append(scene)
+                        else:
+                            predictions[scene["scene_key"]][relinventory] = {
+                                "status": "segmentation_error",
+                                "parsed": "NONE",
+                                "error": scene["error"],
+                            }
+                    results = None
+                    if batch_size > 1 and valid:
+                        try:
+                            results = list(parser.from_edus_batch(
+                                [scene["edus"] for scene in valid], batch_size=batch_size
+                            ))
+                        except Exception as exc:
+                            tqdm.write(
+                                f"batch parsing {relinventory} failed ({type(exc).__name__}: "
+                                f"{exc}); retrying {len(valid)} scenes individually"
+                            )
+                        if results is not None and len(results) != len(valid):
+                            raise RuntimeError("UniRST returned an unexpected batch result count")
+                    for index, scene in enumerate(valid):
+                        try:
+                            result = (
+                                parser.from_edus(scene["edus"])
+                                if results is None else results[index]
+                            )
+                            parsed = adapter.to_constituency_format(result, len(scene["edus"]))
+                            predictions[scene["scene_key"]][relinventory] = {
+                                "status": "ok", "parsed": parsed, "error": None,
+                            }
+                        except Exception as exc:
+                            predictions[scene["scene_key"]][relinventory] = {
+                                "status": "error", "parsed": "NONE",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                    progress.update(len(chunk))
         finally:
             del parser
             gc.collect()
@@ -594,6 +620,7 @@ def run_group(
     force_segmentation: bool,
     output_mode: str,
     force_parsing: bool = False,
+    batch_size: int = 1,
 ) -> None:
     if not documents:
         return
@@ -664,6 +691,7 @@ def run_group(
         scenes,
         inventories=inventories_to_parse,
         on_inventory_complete=save_intermediate_outputs,
+        batch_size=batch_size,
     )
     if output_mode in {"paired", "both"}:
         # Paired artifacts are the final complete product and must not expose
@@ -723,9 +751,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-mode", choices=("separate", "paired", "both"), default="both")
     parser.add_argument("--force-segmentation", action="store_true")
     parser.add_argument("--force-parsing", action="store_true")
+    parser.add_argument(
+        "--batch-size", type=int, default=1,
+        help="Scenes per UniRST from_edus_batch call; 1 uses individual inference.",
+    )
     parser.add_argument("--skip-hc3", action="store_true")
     parser.add_argument("--skip-mage", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error("--batch-size must be positive")
+    return args
 
 
 def main() -> None:
@@ -759,6 +794,7 @@ def main() -> None:
                 args.force_segmentation,
                 args.output_mode,
                 args.force_parsing,
+                batch_size=args.batch_size,
             )
 
     # Human Detectors is a small, unsharded held-out collection.  As with HC3,
@@ -778,6 +814,7 @@ def main() -> None:
             args.force_segmentation,
             args.output_mode,
             args.force_parsing,
+            batch_size=args.batch_size,
         )
 
     if args.storyscope_dataset is not None:
@@ -810,6 +847,7 @@ def main() -> None:
                     args.force_segmentation,
                     args.output_mode,
                     args.force_parsing,
+                    batch_size=args.batch_size,
                 )
 
     if not args.skip_mage:
@@ -828,6 +866,7 @@ def main() -> None:
                 args.force_segmentation,
                 args.output_mode,
                 args.force_parsing,
+                batch_size=args.batch_size,
             )
 
 
