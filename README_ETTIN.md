@@ -13,8 +13,10 @@ names and document, scene-tree, graph, and motif formats are retained.
   inventory matching, or nuclearity pooling is applied.
 - Keep dev's dataset ingestion, labels, scene splitting, output checkpointing,
   graphs, motif extraction/selection, distribution calculation, and split logic.
-  Scene chunks still use the inherited XLM-R token-budget splitter; changing
-  that would be a separate methodological decision.
+  Documents fitting one GUM encoder window are processed intact. Longer
+  documents fall back to the inherited XLM-R token-budget scene splitter.
+  This changes tree boundaries relative to the earlier scene-split setup;
+  use a new output root rather than mixing results.
 
 These are two trained parsers with different corpora and relation spaces.
 Their score difference is not an inventory-only or fine-versus-coarse effect.

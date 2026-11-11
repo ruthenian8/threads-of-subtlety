@@ -12,7 +12,7 @@ import warnings
 import torch
 from dipo.rst.data.tree import RstTree
 
-from tos.ettin import EttinAdapter, EttinParser, GUM, MODELS, RSTDT, legacy_result
+from tos.ettin import EttinAdapter, EttinParser, EttinSceneSplitter, GUM, MODELS, RSTDT, legacy_result
 from tos.tos_dataset import ToSDataset
 from tos.unirst import UniRSTAdapter, load_or_create_segmentation_cache
 
@@ -67,6 +67,20 @@ class Model:
 
 
 class EttinAdapterTest(unittest.TestCase):
+    def test_scene_splitter_preserves_fitting_document_and_falls_back_for_longer(self):
+        model = Model()
+        model.max_length = 5
+        model.config.encoder_window_size = None
+        adapter = EttinAdapter(model_loader=lambda *a, **kw: model)
+        splitter = EttinSceneSplitter(adapter)
+        document = "one\n\ntwo three"
+        self.assertEqual(splitter.split(document), [document])
+        fallback = mock.Mock()
+        fallback.split.return_value = ["one two", "three four"]
+        with mock.patch("tos.ettin.SceneSplitter", return_value=fallback):
+            self.assertEqual(splitter.split("one two three four"), ["one two", "three four"])
+        fallback.split.assert_called_once_with("one two three four")
+
     def test_native_conversion_keeps_nested_spans_nuclearity_and_labels(self):
         edus = ["First.", "Second.", "Third."]
         tree = RstTree.from_parsing_actions(

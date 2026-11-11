@@ -8,7 +8,7 @@ import warnings
 from types import SimpleNamespace
 from typing import Any, Callable, Optional, Sequence
 
-from .unirst import UniRSTAdapter
+from .unirst import SceneSplitter, UniRSTAdapter
 
 DIPO_REVISION = "4debc92e41140e5bcd9aadb987a297244c0fb14a"
 GUM = "eng.erst.gum-12.1.0.ettin"
@@ -18,6 +18,32 @@ MODELS = {
     RSTDT: ("larc-iu/dmrst-ettin-400m-rstdt-coarse", "26594833545ef713d14e2ea6e9a7670c881c143a"),
 }
 DEFAULT_REL_INVENTORIES = (GUM, RSTDT)
+
+
+class EttinSceneSplitter:
+    """Keep documents fitting one GUM encoder window intact; split longer ones."""
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self._fallback = None
+
+    def split(self, document):
+        from dipo.rst.parsers.common.encoding import encode_with_offsets, _window_sentinels
+        from dipo.rst.parsers.common.whitespace import normalize_whitespace
+
+        model = self.adapter.segmenter().model
+        normalized, _ = normalize_whitespace(document, drop_cjk_gaps=model.config.split_cjk_tokens)
+        ids, _ = encode_with_offsets(model.tokenizer, normalized, split_cjk=model.config.split_cjk_tokens)
+        if model.config.encoder_window_size is not None:
+            limit = model.config.encoder_window_size
+        else:
+            prefix, suffix = _window_sentinels(model.tokenizer)
+            limit = model.max_length - len(prefix) - len(suffix)
+        if len(ids) <= limit:
+            return [document] if document.strip() else []
+        if self._fallback is None:
+            self._fallback = SceneSplitter()
+        return self._fallback.split(document)
 
 
 def legacy_result(tree: Any, edus: Sequence[str]) -> dict:
@@ -141,6 +167,7 @@ class EttinAdapter(UniRSTAdapter):
         """Prevent existence-based resumption from silently mixing parser settings."""
         expected = {
             "backend": "dipo", "revision": DIPO_REVISION,
+            "scene_policy": "whole-document-if-single-gum-window-v1",
             "models": {key: {"id": repo, "revision": rev} for key, (repo, rev) in MODELS.items()},
             "segmentation": self.segmentation_provenance,
         }

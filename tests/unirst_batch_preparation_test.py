@@ -112,7 +112,7 @@ class BatchPreparationTest(unittest.TestCase):
         argv = ["prepare", "--batch-size", "4", "--human-detectors-path", "hd.json",
                 "--storyscope-dataset", "storyscope", "--storyscope-splits", "test"]
         with mock.patch.object(sys, "argv", argv), \
-             mock.patch.object(preparation, "SceneSplitter"), \
+             mock.patch.object(preparation, "EttinSceneSplitter"), \
              mock.patch.object(preparation, "UniRSTAdapter"), \
              mock.patch.object(preparation, "hc3_groups", return_value={"finance": [{}]}), \
              mock.patch.object(preparation, "human_detectors_group", return_value=[{}]), \

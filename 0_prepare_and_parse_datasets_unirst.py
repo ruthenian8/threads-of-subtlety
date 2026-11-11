@@ -40,10 +40,10 @@ from tos.tos_utils import split_list_into_n_chunks
 from tos.ettin import (
     DEFAULT_REL_INVENTORIES,
     GUM,
+    EttinSceneSplitter,
     EttinAdapter as UniRSTAdapter,
 )
 from tos.unirst import (
-    SceneSplitter,
     build_scene_lookup,
     load_or_create_segmentation_cache,
     write_jsonl_documents,
@@ -783,7 +783,7 @@ def main() -> None:
         cuda_device=args.gpu_id if torch.cuda.is_available() else -1,
     )
     adapter.ensure_output_provenance(args.output_dir)
-    splitter = SceneSplitter()
+    splitter = EttinSceneSplitter(adapter)
 
     # HC3 is not sharded across workers, so only the designated worker may
     # process it during a multi-GPU MAGE run.  This avoids duplicate parsing

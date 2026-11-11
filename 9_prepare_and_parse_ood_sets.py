@@ -17,9 +17,8 @@ from rich.progress import track
 from tqdm.auto import tqdm
 
 from tos.tos_dataset import Document, SceneDiscourseTree, ToSDataset
-from tos.ettin import DEFAULT_REL_INVENTORIES, GUM, EttinAdapter as UniRSTAdapter
+from tos.ettin import DEFAULT_REL_INVENTORIES, GUM, EttinAdapter as UniRSTAdapter, EttinSceneSplitter
 from tos.unirst import (
-    SceneSplitter,
     build_scene_lookup,
     load_or_create_segmentation_cache,
 )
@@ -51,7 +50,7 @@ def load_unirst_motifs(motif_dir, dataset_name, motif_sizes):
     }
 
 
-def make_document_specs(df, split: str, splitter: SceneSplitter) -> List[Dict[str, Any]]:
+def make_document_specs(df, split: str, splitter: EttinSceneSplitter) -> List[Dict[str, Any]]:
     """Convert an OOD frame to script-0-compatible document specifications."""
     documents = []
     for document_index, row in tqdm(
@@ -288,7 +287,7 @@ def main(argv=None):
             cuda_device=args.gpu_id if args.gpu_id is not None else -1,
         )
         adapter.ensure_output_provenance(os.path.dirname(output_dir) or ".")
-        splitter = SceneSplitter()
+        splitter = EttinSceneSplitter(adapter)
         motifs = load_unirst_motifs(motif_dir, dataset_name, motif_sizes)
         tos_dataset = None
     else:

@@ -94,7 +94,7 @@ class StoryScopePreparationTest(unittest.TestCase):
         ]
         with mock.patch.object(sys, "argv", args), \
              mock.patch.object(preparation, "load_dataset", return_value=dataset) as load, \
-             mock.patch.object(preparation, "SceneSplitter", return_value=FakeSplitter()), \
+             mock.patch.object(preparation, "EttinSceneSplitter", return_value=FakeSplitter()), \
              mock.patch.object(preparation, "UniRSTAdapter"), \
              mock.patch.object(preparation, "run_group") as run:
             preparation.main()
