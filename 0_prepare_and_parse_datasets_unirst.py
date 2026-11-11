@@ -1,20 +1,20 @@
-"""Prepare HC3, MAGE, Human Detectors, and StoryScope with shared UniRST segmentation.
+"""Prepare HC3, MAGE, Human Detectors, and StoryScope with shared GUM Ettin segmentation.
 
 Example:
     python 0_prepare_and_parse_datasets_unirst.py \
-        --total-gpus 1 --gpu-id 0 --output-dir data/unirst
+        --total-gpus 1 --gpu-id 0 --output-dir data/ettin/unirst
 
 Human Detectors only:
     python 0_prepare_and_parse_datasets_unirst.py \
         --skip-hc3 --skip-mage \
         --human-detectors-path /path/to/human_detectors.json \
-        --output-dir data/unirst
+        --output-dir data/ettin/unirst
 
 StoryScope test only (one record per nonempty model story):
     python 0_prepare_and_parse_datasets_unirst.py \
         --skip-hc3 --skip-mage \
         --storyscope-dataset jjrussell10/storyscope \
-        --storyscope-splits test --output-dir data/unirst
+        --storyscope-splits test --output-dir data/ettin/unirst
 
 Run this script once per GPU for MAGE or StoryScope when using multiple GPUs.
 Each worker owns a separate segmentation pickle and output shard.
@@ -37,10 +37,13 @@ from tqdm.auto import tqdm
 
 from tos.tos_dataset import Document, SceneDiscourseTree
 from tos.tos_utils import split_list_into_n_chunks
-from tos.unirst import (
+from tos.ettin import (
     DEFAULT_REL_INVENTORIES,
+    GUM,
+    EttinAdapter as UniRSTAdapter,
+)
+from tos.unirst import (
     SceneSplitter,
-    UniRSTAdapter,
     build_scene_lookup,
     load_or_create_segmentation_cache,
     write_jsonl_documents,
@@ -713,7 +716,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--total-gpus", type=int, default=1)
     parser.add_argument("--gpu-id", type=int, default=0)
-    parser.add_argument("--output-dir", default="data/unirst")
+    parser.add_argument("--output-dir", default="data/ettin/unirst")
     parser.add_argument("--segments-dir", default=None)
     parser.add_argument("--hc3-dataset", default="Hello-SimpleAI/HC3")
     parser.add_argument("--mage-dataset", default="yaful/MAGE")
@@ -745,16 +748,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--min-char-len", type=int, default=10)
-    parser.add_argument("--segment-relinventory", default="deu.rst.pcc")
-    parser.add_argument("--relinventories", nargs="+", default=list(DEFAULT_REL_INVENTORIES))
-    parser.add_argument("--hf-model-name", default="tchewik/isanlp_rst_v3")
-    parser.add_argument("--hf-model-version", default="unirst")
+    parser.add_argument("--segment-relinventory", choices=DEFAULT_REL_INVENTORIES, default=GUM)
+    parser.add_argument(
+        "--relinventories", nargs="+", choices=DEFAULT_REL_INVENTORIES,
+        default=list(DEFAULT_REL_INVENTORIES),
+    )
     parser.add_argument("--output-mode", choices=("separate", "paired", "both"), default="both")
     parser.add_argument("--force-segmentation", action="store_true")
     parser.add_argument("--force-parsing", action="store_true")
     parser.add_argument(
         "--batch-size", type=int, default=1,
-        help="Scenes per UniRST from_edus_batch call; 1 uses individual inference.",
+        help="Scenes per scheduling chunk; pinned Dipo inference is sequential.",
     )
     parser.add_argument("--skip-hc3", action="store_true")
     parser.add_argument("--skip-mage", action="store_true")
@@ -770,15 +774,16 @@ def main() -> None:
         raise ValueError("--gpu-id must be in [0, --total-gpus)")
     if args.storyscope_batch_prompts < 1:
         raise ValueError("--storyscope-batch-prompts must be at least 1")
-    segments_dir = args.segments_dir or os.path.join(args.output_dir, "segments-deu.rst.pcc")
-    splitter = SceneSplitter()
+    segments_dir = args.segments_dir or os.path.join(
+        args.output_dir, f"segments-{args.segment_relinventory}"
+    )
     adapter = UniRSTAdapter(
         segment_relinventory=args.segment_relinventory,
         relation_inventories=args.relinventories,
-        hf_model_name=args.hf_model_name,
-        hf_model_version=args.hf_model_version,
         cuda_device=args.gpu_id if torch.cuda.is_available() else -1,
     )
+    adapter.ensure_output_provenance(args.output_dir)
+    splitter = SceneSplitter()
 
     # HC3 is not sharded across workers, so only the designated worker may
     # process it during a multi-GPU MAGE run.  This avoids duplicate parsing

@@ -1,8 +1,8 @@
-"""Parse MAGE OOD documents and add UniRST motif distributions.
+"""Parse MAGE OOD documents with Ettin and add inventory-specific motifs.
 
 Motif catalogs are now generated independently for every relation inventory,
 so an inventory-specific motif directory can be selected with ``--relinventory``.
-The old ``data/mage`` input/output layout remains the default.
+The isolated ``data/ettin`` root is the default on this branch.
 """
 
 import argparse
@@ -17,9 +17,9 @@ from rich.progress import track
 from tqdm.auto import tqdm
 
 from tos.tos_dataset import Document, SceneDiscourseTree, ToSDataset
+from tos.ettin import DEFAULT_REL_INVENTORIES, GUM, EttinAdapter as UniRSTAdapter
 from tos.unirst import (
     SceneSplitter,
-    UniRSTAdapter,
     build_scene_lookup,
     load_or_create_segmentation_cache,
 )
@@ -239,7 +239,7 @@ def process_df(df, tos_dataset):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--data-dir", default="data/ettin")
     parser.add_argument("--input-dir", help="directory containing MAGE OOD CSV files")
     parser.add_argument("--output-dir", help="where parsed OOD JSONL files are written")
     parser.add_argument(
@@ -248,11 +248,9 @@ def main(argv=None):
         help="DMRST parser checkout (defaults to the historical location)",
     )
     parser.add_argument("--motif-dir")
-    parser.add_argument("--relinventory")
-    parser.add_argument("--segment-relinventory", default="deu.rst.pcc")
+    parser.add_argument("--relinventory", choices=DEFAULT_REL_INVENTORIES, default=GUM)
+    parser.add_argument("--segment-relinventory", choices=DEFAULT_REL_INVENTORIES, default=GUM)
     parser.add_argument("--segments-dir")
-    parser.add_argument("--hf-model-name", default="tchewik/isanlp_rst_v3")
-    parser.add_argument("--hf-model-version", default="unirst")
     parser.add_argument("--force-segmentation", action="store_true")
     parser.add_argument("--force-parsing", action="store_true")
     parser.add_argument("--dataset-name")
@@ -287,10 +285,9 @@ def main(argv=None):
         adapter = UniRSTAdapter(
             segment_relinventory=args.segment_relinventory,
             relation_inventories=(args.relinventory,),
-            hf_model_name=args.hf_model_name,
-            hf_model_version=args.hf_model_version,
             cuda_device=args.gpu_id if args.gpu_id is not None else -1,
         )
+        adapter.ensure_output_provenance(os.path.dirname(output_dir) or ".")
         splitter = SceneSplitter()
         motifs = load_unirst_motifs(motif_dir, dataset_name, motif_sizes)
         tos_dataset = None

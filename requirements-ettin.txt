@@ -1,0 +1,16 @@
+# Separate environment for the Ettin branch; retain requirements.txt for legacy runs.
+accelerate
+datasets<4.0.0
+evaluate
+networkx
+dipo @ git+https://github.com/larc-iu/dipo.git@4debc92e41140e5bcd9aadb987a297244c0fb14a
+peft==0.14.0
+pydantic
+rich
+scikit-learn
+sentsplit
+tqdm
+torch
+torchaudio
+torchvision
+transformers==4.49.0

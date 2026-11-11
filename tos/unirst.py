@@ -595,7 +595,7 @@ def _atomic_pickle_dump(value: Any, path: str) -> None:
 def _cache_metadata(
     adapter: UniRSTAdapter, scene_specs: Sequence[Mapping[str, Any]]
 ) -> Dict[str, Any]:
-    return {
+    metadata = {
         "schema_version": adapter.cache_schema_version,
         "hf_model_name": adapter.hf_model_name,
         "hf_model_version": adapter.hf_model_version,
@@ -603,6 +603,9 @@ def _cache_metadata(
         "scene_keys": [spec["scene_key"] for spec in scene_specs],
         "scene_text_hashes": [_text_hash(spec["text"]) for spec in scene_specs],
     }
+    if hasattr(adapter, "segmentation_provenance"):
+        metadata["segmentation_provenance"] = adapter.segmentation_provenance
+    return metadata
 
 
 def _valid_cache(

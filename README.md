@@ -12,7 +12,17 @@ Some preprocessing updates were made, which may have contributed to performance 
 | Longformer-Plain | 96.74% | 88.64%    | 69.48%   | 55.95%        |
 | Longformer-Motif | 97.42% | 91.83%    | 82.63%   | 76.15%        |
 
-## UniRST reproduction
+## Ettin DMRST branch
+
+This branch replaces the default preprocessing parsers with the two requested
+Dipo Ettin checkpoints. See [README_ETTIN.md](README_ETTIN.md) for installation,
+approved segmentation choices, model provenance, and downstream commands.
+The input preparation and graph/motif formats are inherited from dev.
+
+## Legacy UniRST reproduction
+
+The section below describes the parent dev branch. On this branch use the
+Ettin instructions above; the historical script filename is retained.
 
 The UniRST reproduction replaces the DMRST parsing stage without patching
 `isanlp_rst`. Each scene is segmented once with `deu.rst.pcc`; the segmented
