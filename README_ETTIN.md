@@ -37,6 +37,26 @@ the legacy requirements.txt pin does not. No UniRST weights are loaded.
 python 0_prepare_and_parse_datasets_unirst.py --output-dir data/ettin/unirst
 ```
 
+For independent parallel workers, give every worker the same shard count and
+a distinct zero-based shard index. GPU IDs select devices independently of
+shard IDs; use a separate output root for each complete sharding scheme:
+
+```bash
+python 0_prepare_and_parse_datasets_unirst.py --shard-count 2 --shard-index 0 --gpu-id 0 --output-dir data/ettin-sharded/unirst
+python 0_prepare_and_parse_datasets_unirst.py --shard-count 2 --shard-index 1 --gpu-id 1 --output-dir data/ettin-sharded/unirst
+```
+
+Launch these commands in separate processes. Each shard handles its own subset
+of every enabled dataset and has distinct output and segmentation-cache names;
+the count is included in those names. Do not launch two processes for the same
+shard. Provenance prevents changing the shard count or mixing indexed and
+unindexed runs in the same output root.
+Check that all shard jobs succeeded before downstream stages. The HC3 split
+stage combines shards by domain before applying its per-domain quotas.
+The existing --total-gpus mode is separate and cannot
+be combined with indexed shards. --batch-size remains unrelated: it does not
+batch model inference.
+
 All dev input flags remain available: --hc3-dataset, --mage-dataset,
 --human-detectors-path, and --storyscope-dataset/--storyscope-splits.
 --relinventories can select either or both of:

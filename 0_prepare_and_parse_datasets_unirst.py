@@ -54,7 +54,8 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
-def hc3_groups(dataset_name: str, splitter: SceneSplitter, min_char_len: int) -> Dict[str, List[Dict[str, Any]]]:
+def hc3_groups(dataset_name: str, splitter: SceneSplitter, min_char_len: int,
+               shard_count: int = 1, shard_index: int = 0) -> Dict[str, List[Dict[str, Any]]]:
     raw_dataset = load_dataset(dataset_name, name="all")["train"]
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     document_index = 0
@@ -71,18 +72,22 @@ def hc3_groups(dataset_name: str, splitter: SceneSplitter, min_char_len: int) ->
             (human_answer, "human", 1),
             (llm_answer, "llm", 0),
         ):
+            current_index = document_index
+            document_index += 1
+            # Keep the two answers to each HC3 prompt in the same shard.
+            if (current_index // 2) % shard_count != shard_index:
+                continue
             grouped[source].append(
                 make_document_spec(
                     dataset="hc3",
                     split="train",
-                    document_index=document_index,
+                    document_index=current_index,
                     text=text,
                     source=f"{source}_{suffix}",
                     label=label,
                     scenes=splitter.split(text),
                 )
             )
-            document_index += 1
     return grouped
 
 
@@ -92,9 +97,11 @@ def mage_group(
     splitter: SceneSplitter,
     total_gpus: int,
     gpu_id: int,
+    target_indices: Optional[Sequence[int]] = None,
 ) -> List[Dict[str, Any]]:
-    chunks = list(split_list_into_n_chunks(range(len(raw_dataset[split])), total_gpus))
-    target_indices = chunks[gpu_id]
+    if target_indices is None:
+        chunks = list(split_list_into_n_chunks(range(len(raw_dataset[split])), total_gpus))
+        target_indices = chunks[gpu_id]
     return [
         make_document_spec(
             dataset="mage",
@@ -197,6 +204,8 @@ def human_detectors_group(
     dataset_path: str,
     splitter: SceneSplitter,
     min_char_len: int,
+    shard_count: int = 1,
+    shard_index: int = 0,
 ) -> List[Dict[str, Any]]:
     """Load the released Human Detectors JSON as one held-out test group.
 
@@ -234,11 +243,11 @@ def human_detectors_group(
 
     documents: List[Dict[str, Any]] = []
     seen_record_ids = set()
-    for key, record in tqdm(
+    for record_index, (key, record) in enumerate(tqdm(
         sorted(keyed_records, key=record_sort_key),
         desc="preparing Human Detectors",
         unit="document",
-    ):
+    )):
         if not isinstance(record, Mapping):
             raise ValueError(f"Human Detectors record {key!r} is not an object")
 
@@ -262,6 +271,8 @@ def human_detectors_group(
         article = article.strip()
         if len(article) < min_char_len:
             continue
+        if record_index % shard_count != shard_index:
+            continue
 
         generation_model = safe_name(str(record.get("generation_model", "unknown")))
         prompt_id = safe_name(str(record.get("prompt_id", record_id)))
@@ -274,7 +285,7 @@ def human_detectors_group(
             make_document_spec(
                 dataset="human_detectors",
                 split="test",
-                document_index=len(documents),
+                document_index=record_index if shard_count > 1 else len(documents),
                 text=article,
                 source=source,
                 label=label,
@@ -716,6 +727,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--total-gpus", type=int, default=1)
     parser.add_argument("--gpu-id", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=None,
+                        help="Number of deterministic independent data shards.")
+    parser.add_argument("--shard-index", type=int, default=None,
+                        help="Zero-based shard to process; requires --shard-count.")
     parser.add_argument("--output-dir", default="data/ettin/unirst")
     parser.add_argument("--segments-dir", default=None)
     parser.add_argument("--hc3-dataset", default="Hello-SimpleAI/HC3")
@@ -765,12 +780,21 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
+    if (args.shard_count is None) != (args.shard_index is None):
+        parser.error("--shard-count and --shard-index must be specified together")
+    if args.shard_count is not None and (
+        args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count
+    ):
+        parser.error("require --shard-count >= 1 and 0 <= --shard-index < --shard-count")
+    if args.shard_count is not None and args.total_gpus != 1:
+        parser.error("indexed shards cannot be combined with --total-gpus")
     return args
 
 
 def main() -> None:
     args = parse_args()
-    if args.gpu_id < 0 or args.gpu_id >= args.total_gpus:
+    indexed = args.shard_count is not None
+    if args.gpu_id < 0 or (not indexed and args.gpu_id >= args.total_gpus):
         raise ValueError("--gpu-id must be in [0, --total-gpus)")
     if args.storyscope_batch_prompts < 1:
         raise ValueError("--storyscope-batch-prompts must be at least 1")
@@ -782,41 +806,43 @@ def main() -> None:
         relation_inventories=args.relinventories,
         cuda_device=args.gpu_id if torch.cuda.is_available() else -1,
     )
-    adapter.ensure_output_provenance(args.output_dir)
+    if indexed:
+        adapter.ensure_output_provenance(args.output_dir, shard_count=args.shard_count)
+    else:
+        adapter.ensure_output_provenance(args.output_dir)
     splitter = EttinSceneSplitter(adapter)
 
-    # HC3 is not sharded across workers, so only the designated worker may
-    # process it during a multi-GPU MAGE run.  This avoids duplicate parsing
-    # and concurrent writes to the shared HC3 cache and output files.
-    if not args.skip_hc3 and args.gpu_id == 0:
-        for source, documents in hc3_groups(args.hc3_dataset, splitter, args.min_char_len).items():
+    # Legacy GPU mode uses worker 0 for HC3; indexed mode partitions it.
+    shard_suffix = f"_shard{args.shard_index:05d}-of-{args.shard_count:05d}" if indexed else ""
+    if not args.skip_hc3 and (indexed or args.gpu_id == 0):
+        hc3_kwargs = dict(shard_count=args.shard_count, shard_index=args.shard_index) if indexed else {}
+        for source, documents in hc3_groups(args.hc3_dataset, splitter, args.min_char_len, **hc3_kwargs).items():
             run_group(
                 documents,
                 adapter,
                 segments_dir,
                 args.output_dir,
-                f"hc3_{safe_name(source)}",
-                f"hc3_{safe_name(source)}",
+                f"hc3_{safe_name(source)}{shard_suffix}",
+                f"hc3_{safe_name(source)}{shard_suffix}",
                 args.force_segmentation,
                 args.output_mode,
                 args.force_parsing,
                 batch_size=args.batch_size,
             )
 
-    # Human Detectors is a small, unsharded held-out collection.  As with HC3,
-    # restricting it to worker 0 prevents duplicate model work and cache writes
-    # during a multi-GPU MAGE launch.
-    if args.human_detectors_path is not None and args.gpu_id == 0:
+    # In legacy GPU mode only worker 0 handles the unsharded collection.
+    if args.human_detectors_path is not None and (indexed or args.gpu_id == 0):
         documents = human_detectors_group(
-            args.human_detectors_path, splitter, args.min_char_len
+            args.human_detectors_path, splitter, args.min_char_len,
+            **(dict(shard_count=args.shard_count, shard_index=args.shard_index) if indexed else {})
         )
         run_group(
             documents,
             adapter,
             segments_dir,
             args.output_dir,
-            "human_detectors_test",
-            "human_detectors_test",
+            f"human_detectors_test{shard_suffix}",
+            f"human_detectors_test{shard_suffix}",
             args.force_segmentation,
             args.output_mode,
             args.force_parsing,
@@ -831,7 +857,8 @@ def main() -> None:
                     range(len(split_dataset)), args.total_gpus
                 )
             )
-            worker_indices = chunks[args.gpu_id]
+            worker_indices = (range(args.shard_index, len(split_dataset), args.shard_count)
+                              if indexed else chunks[args.gpu_id])
             for batch_index, start in enumerate(
                 range(0, len(worker_indices), args.storyscope_batch_prompts)
             ):
@@ -841,7 +868,7 @@ def main() -> None:
                     args.gpu_id, args.min_char_len, prompt_indices=indices,
                 )
                 shard_name = (
-                    f"storyscope_{split}_gpu{args.gpu_id}_batch{batch_index:04d}"
+                    f"storyscope_{split}{shard_suffix if indexed else f'_gpu{args.gpu_id}'}_batch{batch_index:04d}"
                 )
                 run_group(
                     documents,
@@ -859,16 +886,18 @@ def main() -> None:
     if not args.skip_mage:
         raw_mage = load_dataset(args.mage_dataset)
         for split in ("train", "validation", "test"):
+            indices = range(args.shard_index, len(raw_mage[split]), args.shard_count) if indexed else None
             documents = mage_group(
-                raw_mage, split, splitter, args.total_gpus, args.gpu_id
+                raw_mage, split, splitter, args.total_gpus, args.gpu_id,
+                **({"target_indices": indices} if indexed else {})
             )
             run_group(
                 documents,
                 adapter,
                 segments_dir,
                 args.output_dir,
-                f"mage_{split}_{args.gpu_id}",
-                f"mage_{split}_gpu{args.gpu_id}",
+                f"mage_{split}{shard_suffix}" if indexed else f"mage_{split}_{args.gpu_id}",
+                f"mage_{split}{shard_suffix}" if indexed else f"mage_{split}_gpu{args.gpu_id}",
                 args.force_segmentation,
                 args.output_mode,
                 args.force_parsing,

@@ -163,7 +163,7 @@ class EttinAdapter(UniRSTAdapter):
             warnings.warn("Pinned Dipo segments documents individually; no native segmentation batching.")
         return super().segment_scenes(texts, batch_size=batch_size)
 
-    def ensure_output_provenance(self, output_dir: str) -> None:
+    def ensure_output_provenance(self, output_dir: str, shard_count: Optional[int] = None) -> None:
         """Prevent existence-based resumption from silently mixing parser settings."""
         expected = {
             "backend": "dipo", "revision": DIPO_REVISION,
@@ -171,6 +171,8 @@ class EttinAdapter(UniRSTAdapter):
             "models": {key: {"id": repo, "revision": rev} for key, (repo, rev) in MODELS.items()},
             "segmentation": self.segmentation_provenance,
         }
+        if shard_count is not None:
+            expected["sharding"] = {"method": "round-robin-v1", "shard_count": shard_count}
         path = os.path.join(output_dir, "ettin_provenance.json")
         os.makedirs(output_dir, exist_ok=True)
         if os.path.exists(path):
@@ -185,7 +187,14 @@ class EttinAdapter(UniRSTAdapter):
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(expected, handle, indent=2)
                 handle.write("\n")
-            os.replace(temporary, path)
+            # Publish the complete manifest without overwriting another worker's
+            # concurrently published provenance.
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                with open(path, encoding="utf-8") as handle:
+                    if json.load(handle) != expected:
+                        raise ValueError("Output provenance differs; choose a new --output-dir")
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)

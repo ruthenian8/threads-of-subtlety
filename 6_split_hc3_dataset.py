@@ -68,6 +68,9 @@ def split_inventory(
         # Human and machine files are two shards of one HC3 domain.  They
         # must share one quota so validation/test sizes remain per-domain.
         domain = match.group(1) if match else os.path.splitext(basename)[0]
+        # Indexed preprocessing shards are parts of the same original domain,
+        # not independent domains with separate validation/test quotas.
+        domain = re.sub(r"_shard\d+-of-\d+$", "", domain)
         domains[domain].extend(ToSDataset.load_document_corpus(file_path))
 
     for domain, dataset in sorted(domains.items()):

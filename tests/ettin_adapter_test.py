@@ -235,6 +235,79 @@ class EttinAdapterTest(unittest.TestCase):
         self.assertEqual(args.segment_relinventory, GUM)
         self.assertEqual(tuple(args.relinventories), (GUM, RSTDT))
 
+    def test_indexed_hc3_and_mage_shards_are_disjoint_and_complete(self):
+        prep = load_script("0_prepare_and_parse_datasets_unirst.py")
+        data = [{"source": "finance", "human_answers": [f"human text {i}"],
+                 "chatgpt_answers": [f"machine text {i}"]} for i in range(7)]
+        splitter = SimpleNamespace(split=lambda text: [text])
+        with mock.patch.object(prep, "load_dataset", return_value={"train": data}):
+            shards = [prep.hc3_groups("fake", splitter, 1, 3, i).get("finance", [])
+                      for i in range(3)]
+            full = prep.hc3_groups("fake", splitter, 1)["finance"]
+        ids = [{document["document_index"] for document in shard} for shard in shards]
+        self.assertEqual(set.union(*ids), {document["document_index"] for document in full})
+        self.assertFalse(any(ids[i] & ids[j] for i in range(3) for j in range(i)))
+        self.assertTrue(all((i ^ 1) in shard for shard in ids for i in shard))
+        mage = {"train": [{"text": str(i), "src": "x", "label": 1} for i in range(7)]}
+        ids = [{d["document_index"] for d in prep.mage_group(
+            mage, "train", splitter, 1, 0, range(i, 7, 3))} for i in range(3)]
+        self.assertEqual(set.union(*ids), set(range(7)))
+        self.assertFalse(any(ids[i] & ids[j] for i in range(3) for j in range(i)))
+
+    def test_indexed_cli_validates_shard_flags(self):
+        prep = load_script("0_prepare_and_parse_datasets_unirst.py")
+        import sys
+        for argv in (["prepare", "--shard-index", "0"],
+                     ["prepare", "--shard-count", "2", "--shard-index", "2"],
+                     ["prepare", "--shard-count", "2", "--shard-index", "0",
+                      "--total-gpus", "2"]):
+            with mock.patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+                prep.parse_args()
+        with mock.patch.object(sys, "argv", ["prepare", "--shard-count", "2",
+                                            "--shard-index", "1", "--gpu-id", "3"]):
+            args = prep.parse_args()
+        self.assertEqual((args.shard_count, args.shard_index, args.gpu_id), (2, 1, 3))
+
+    def test_shard_provenance_rejects_different_layouts(self):
+        adapter = EttinAdapter()
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter.ensure_output_provenance(tmp, shard_count=3)
+            adapter.ensure_output_provenance(tmp, shard_count=3)
+            with self.assertRaisesRegex(ValueError, "provenance differs"):
+                adapter.ensure_output_provenance(tmp, shard_count=2)
+            with self.assertRaisesRegex(ValueError, "provenance differs"):
+                adapter.ensure_output_provenance(tmp)
+
+    def test_hc3_split_applies_quotas_per_domain_across_shards(self):
+        splitter = load_script("6_split_hc3_dataset.py")
+        files = [
+            f"hc3_finance_shard{i:05d}-of-00002_{label}.discourse_parsed.graph_added.m3_m6_motif_dists.jsonl"
+            for i in range(2) for label in ("human", "machine")
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(splitter.ToSDataset, "load_document_corpus", return_value=[1, 2]), \
+             mock.patch.object(splitter.ToSDataset, "save_dataset_as_jsonl"):
+            counts = splitter.split_inventory(files, tmp, "hc3", 2, 2, 42)
+        self.assertEqual(counts, (4, 2, 2))
+
+    def test_indexed_main_routes_independent_gpu_and_shard_paths(self):
+        prep = load_script("0_prepare_and_parse_datasets_unirst.py")
+        import sys
+        argv = ["prepare", "--shard-count", "2", "--shard-index", "1",
+                "--gpu-id", "3", "--skip-mage"]
+        fake_documents = [{"label": 1}]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(prep, "UniRSTAdapter") as adapter, \
+             mock.patch.object(prep, "EttinSceneSplitter"), \
+             mock.patch.object(prep, "hc3_groups", return_value={"finance": fake_documents}) as groups, \
+             mock.patch.object(prep, "run_group") as run, \
+             mock.patch.object(prep.torch.cuda, "is_available", return_value=True):
+            prep.main()
+        self.assertEqual(adapter.call_args.kwargs["cuda_device"], 3)
+        self.assertEqual(groups.call_args.kwargs, {"shard_count": 2, "shard_index": 1})
+        self.assertEqual(run.call_args.args[4], "hc3_finance_shard00001-of-00002")
+        self.assertEqual(run.call_args.args[5], "hc3_finance_shard00001-of-00002")
+
     def test_actual_dipo_model_path_matches_public_segmentation_and_keeps_edus(self):
         from transformers import ModernBertConfig, ModernBertModel
         from dipo.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig, _SegmentationConfig
